@@ -489,8 +489,14 @@ impl Provider for OpenAICompletionsProvider {
         _cancel: watch::Receiver<bool>,
     ) -> KonResult<LLMStream> {
         let request = self.build_request(&messages, system_prompt.as_deref(), &tools)?;
+        tracing::info!(
+            "Sending request to {}/v1/chat/completions with model={}",
+            self.base_url.trim_end_matches('/'),
+            self.config.model_id
+        );
 
         let response = self.send_request(&request).await?;
+        tracing::info!("Got response status: {}", response.status());
 
         // Spawn a task to read the SSE stream and send parts through a channel
         let (tx, rx) = mpsc::channel::<KonResult<StreamPart>>(32);
@@ -550,8 +556,15 @@ async fn process_sse_stream(
     let mut total_usage = Usage::default();
     let mut tool_buffers: std::collections::HashMap<usize, ToolCallBuffer> =
         std::collections::HashMap::new();
+    let mut had_tool_calls = false;
+
+    tracing::info!("SSE stream connected, waiting for chunks...");
 
     while let Some(chunk) = byte_stream.next().await {
+        tracing::debug!(
+            "SSE chunk: {} bytes",
+            chunk.as_ref().map(|c| c.len()).unwrap_or(0)
+        );
         let chunk = chunk.map_err(|e| KonError::Provider(format!("stream read error: {e}")))?;
         let text = String::from_utf8_lossy(&chunk);
         buffer.push_str(&text);
@@ -566,10 +579,14 @@ async fn process_sse_stream(
             }
 
             if line == "data: [DONE]" {
-                // Stream finished
+                let stop_reason = if had_tool_calls {
+                    StopReason::ToolUse
+                } else {
+                    StopReason::Stop
+                };
                 let _ = tx
                     .send(Ok(StreamPart::StreamDone {
-                        stop_reason: StopReason::Stop,
+                        stop_reason,
                         usage: total_usage,
                     }))
                     .await;
@@ -579,7 +596,14 @@ async fn process_sse_stream(
             if let Some(data) = line.strip_prefix("data: ") {
                 match serde_json::from_str::<ChatChunk>(data) {
                     Ok(chunk) => {
-                        process_chunk(chunk, &mut total_usage, &mut tool_buffers, &tx).await?;
+                        process_chunk(
+                            chunk,
+                            &mut total_usage,
+                            &mut tool_buffers,
+                            &mut had_tool_calls,
+                            &tx,
+                        )
+                        .await?;
                     }
                     Err(e) => {
                         // Some chunks may not parse (e.g., keep-alive pings)
@@ -591,9 +615,14 @@ async fn process_sse_stream(
     }
 
     // Stream ended without [DONE] marker
+    let stop_reason = if had_tool_calls {
+        StopReason::ToolUse
+    } else {
+        StopReason::Stop
+    };
     let _ = tx
         .send(Ok(StreamPart::StreamDone {
-            stop_reason: StopReason::Stop,
+            stop_reason,
             usage: total_usage,
         }))
         .await;
@@ -604,8 +633,8 @@ async fn process_sse_stream(
 /// State for buffering a tool call across multiple SSE chunks.
 #[derive(Default)]
 struct ToolCallBuffer {
+    id: String,
     name: Option<String>,
-    arguments: String,
     started: bool,
 }
 
@@ -614,6 +643,7 @@ async fn process_chunk(
     chunk: ChatChunk,
     total_usage: &mut Usage,
     tool_buffers: &mut std::collections::HashMap<usize, ToolCallBuffer>,
+    had_tool_calls: &mut bool,
     tx: &mpsc::Sender<KonResult<StreamPart>>,
 ) -> KonResult<()> {
     // Accumulate usage if present
@@ -659,11 +689,16 @@ async fn process_chunk(
                 if let Some(ref id) = tc.id
                     && !buffer.started
                 {
-                    let name = tc
+                    // Strip special tokens like "<|channel|>json" from name
+                    let raw_name = tc
                         .function
                         .as_ref()
                         .and_then(|f| f.name.clone())
                         .unwrap_or_default();
+                    let name = sanitize_tool_name(&raw_name);
+                    buffer.id = id.clone();
+                    buffer.name = Some(name.clone());
+                    buffer.started = true;
 
                     tx.send(Ok(StreamPart::ToolCallStart {
                         id: id.clone(),
@@ -671,17 +706,17 @@ async fn process_chunk(
                     }))
                     .await
                     .map_err(|_| KonError::Provider("event channel closed".into()))?;
-
-                    buffer.started = true;
                 }
 
-                // Accumulate arguments
-                if let Some(ref func) = tc.function
-                    && !func.arguments.is_empty()
-                {
-                    buffer.arguments.push_str(&func.arguments);
+                if let Some(ref func) = tc.function {
+                    // Use the actual tool call ID for delta matching
+                    let id = if buffer.id.is_empty() {
+                        buffer.name.clone().unwrap_or_else(|| "unknown".into())
+                    } else {
+                        buffer.id.clone()
+                    };
                     tx.send(Ok(StreamPart::ToolCallDelta {
-                        id: buffer.name.clone().unwrap_or_else(|| "unknown".into()),
+                        id,
                         arguments_delta: func.arguments.clone(),
                     }))
                     .await
@@ -694,12 +729,21 @@ async fn process_chunk(
         if let Some(ref finish) = choice.finish_reason
             && finish == "tool_calls"
         {
-            // Don't emit StreamDone here — the tool calls will trigger next turn
-            // The final StreamDone is emitted after all chunks
+            *had_tool_calls = true;
         }
     }
 
     Ok(())
+}
+
+/// Strip special tokens like `<|channel|>json` that some models emit in tool names.
+fn sanitize_tool_name(raw: &str) -> String {
+    // Find the first `<` that starts a special token and truncate
+    if let Some(pos) = raw.find('<') {
+        raw[..pos].to_string()
+    } else {
+        raw.to_string()
+    }
 }
 
 #[cfg(test)]

@@ -89,6 +89,12 @@ async fn run_headless_inner(cli: Cli, prompt_arg: Option<String>) -> KonResult<i
     let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(32);
     let (_cancel_tx, cancel_rx) = watch::channel(false);
 
+    tracing::info!(
+        "Starting agent: provider={}, model={}",
+        provider_config.provider_name,
+        provider_config.model_id
+    );
+
     // Run agent in background
     let handle = tokio::spawn(async move { agent.run(prompt, None, event_tx, cancel_rx).await });
 
@@ -98,9 +104,43 @@ async fn run_headless_inner(cli: Cli, prompt_arg: Option<String>) -> KonResult<i
 
     while let Some(event) = event_rx.recv().await {
         match event {
+            AgentEvent::TurnStart { turn } => {
+                eprintln!("  [turn {turn}]");
+            }
             AgentEvent::TextDelta { text } => {
                 print!("{text}");
                 final_text.push_str(&text);
+            }
+            AgentEvent::ToolStart { id, name } => {
+                eprintln!("  Tool call: {name} ({id})");
+            }
+            AgentEvent::ToolArgsDelta { .. } => {
+                // args streamed in — ignore for headless
+            }
+            AgentEvent::ToolEnd { id: _, arguments } => {
+                // Show parsed arguments
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&arguments) {
+                    if let Some(cmd) = v.get("command").and_then(|c| c.as_str()) {
+                        eprintln!("  → command: {cmd}");
+                    } else if let Some(path) = v.get("file_path").and_then(|p| p.as_str()) {
+                        eprintln!("  → file_path: {path}");
+                    } else {
+                        eprintln!("  → args: {arguments}");
+                    }
+                }
+            }
+            AgentEvent::ToolResult { id: _, result } => {
+                let summary = result.result.as_deref().unwrap_or("(empty)");
+                let truncated: String = summary.lines().take(8).collect::<Vec<_>>().join("\n");
+                let more = if summary.lines().count() > 8 {
+                    "…"
+                } else {
+                    ""
+                };
+                eprintln!("  Result:\n{truncated}{more}");
+            }
+            AgentEvent::TurnEnd { stop_reason, .. } => {
+                eprintln!("  --- [turn end: {stop_reason:?}] ---");
             }
             AgentEvent::End { stop_reason, .. } => {
                 println!(); // newline after final output
