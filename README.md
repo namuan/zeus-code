@@ -1,11 +1,11 @@
-# Zeus
+# ZeusCode
 
 <p align="center">
-  <strong>⚡ Zeus ⚡</strong><br>
+  <strong>⚡ ZeusCode ⚡</strong><br>
   <em>Minimal coding agent harness &mdash; in Rust</em>
 </p>
 
-Zeus is a minimal coding agent with a tiny core prompt, a small built-in toolset, and project-specific context layered
+ZeusCode is a minimal coding agent with a tiny core prompt, a small built-in toolset, and project-specific context layered
 on top only when you want it. The default system prompt stays **under 270 tokens**, the fixed harness at about **~1,000
 tokens**. Six default tools plus two extra web tools give you everything you need.
 
@@ -32,7 +32,7 @@ zeus -p "your prompt" --provider openrouter
 
 > **Requirements:** Rust 1.85+ (edition 2024). Install via [rustup](https://rustup.rs).
 
-## Why Zeus
+## Why ZeusCode
 
 - **Minimal by design** &mdash; System prompt under 270 tokens
 - **6 core tools** &mdash; `read`, `edit`, `write`, `bash`, `grep`, `find`
@@ -66,11 +66,11 @@ zeus -p "your prompt" --provider openrouter
 | ZhiPu                           | API key  | GLM-5                                       |
 | Local (OpenAI-compatible `/v1`) | Optional | llama.cpp, Ollama, etc.                     |
 
-By default Zeus connects to OpenAI Codex. Use the `--provider` flag or set `default_provider` in config to change this.
+By default ZeusCode connects to OpenAI Codex. Use the `--provider` flag or set `default_provider` in config to change this.
 
 ## Configuration
 
-Zeus stores its config at `~/.config/zeus/config.toml`. Created automatically on first run. Key options:
+ZeusCode stores its config at `~/.config/zeus/config.toml`. Created automatically on first run. Key options:
 
 ```toml
 [llm]

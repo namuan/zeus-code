@@ -83,6 +83,12 @@ impl ChatLog {
         self.lines.len()
     }
 
+    /// Collect all line content into a single string (for testing).
+    pub fn all_text(&self) -> String {
+        use ratatui::text::Text;
+        Text::from(self.lines.clone()).to_string()
+    }
+
     /// Scroll up by N visual rows (move away from bottom).
     pub fn scroll_up(&mut self, amount: u16) {
         self.scroll = self.scroll.saturating_add(amount);

@@ -55,6 +55,13 @@ pub struct App {
     /// Used to trim streaming text and replace with formatted blocks on TurnEnd.
     streaming_mark: usize,
 
+    /// Line count in chat before the "⏳ Working…" placeholder line.
+    /// Used to remove the placeholder when a ToolResult arrives.
+    working_mark: Option<usize>,
+
+    /// When the current tool started executing (for elapsed-time display).
+    working_start: Option<Instant>,
+
     /// Accumulated streaming text for the current turn.
     /// Replaced with live markdown rendering on each TextDelta.
     streaming_buffer: String,
@@ -106,6 +113,8 @@ impl App {
             streaming_mark: 0,
             streaming_buffer: String::new(),
             streaming_thinking: String::new(),
+            working_mark: None,
+            working_start: None,
             session: Arc::new(parking_lot::Mutex::new(session)),
             event_tx,
             event_rx,
@@ -259,6 +268,7 @@ impl App {
         self.chat.add_block(user_block);
 
         self.agent_running = true;
+        self.working_start = Some(Instant::now());
         let query = text.to_string();
 
         // Build new channels for this run
@@ -512,9 +522,18 @@ impl App {
                     {
                         self.chat
                             .add_styled_line(&preview, self.styles.thinking_text());
+                        // Save mark before adding the working indicator
+                        self.working_mark = Some(self.chat.line_count());
+                        self.working_start = Some(Instant::now());
+                        self.chat
+                            .add_line("  | Working (0.0s)…".to_string(), &self.styles);
                     }
                 }
                 AgentEvent::ToolResult { result, .. } => {
+                    // Remove the "Working…" placeholder line
+                    if let Some(mark) = self.working_mark.take() {
+                        self.chat.truncate_to(mark);
+                    }
                     let block = render_tool_result("", "tool", &result, &self.styles);
                     self.chat.add_block(block);
                 }
@@ -532,6 +551,7 @@ impl App {
                 } => {
                     self.total_tokens += usage.input_tokens + usage.output_tokens;
                     self.agent_running = false;
+                    self.working_start = None;
                     self.chat.add_line(
                         format!(
                             "  ✓ Done in {total_turns} turns ({} tok)",
@@ -542,11 +562,21 @@ impl App {
                 }
                 AgentEvent::Error { error } => {
                     self.agent_running = false;
+                    self.working_start = None;
                     self.chat
                         .add_line(format!("  ✗ Error: {error}"), &self.styles);
                 }
                 _ => {}
             }
+        }
+
+        // Animate the working indicator while a tool is executing
+        if let (Some(mark), Some(start)) = (self.working_mark, self.working_start) {
+            let elapsed = start.elapsed();
+            let spinner = spinner_frame(elapsed);
+            let text = format!("  {spinner} Working ({:.1}s)…", elapsed.as_secs_f64());
+            self.chat.truncate_to(mark);
+            self.chat.add_line(text, &self.styles);
         }
     }
 
@@ -569,6 +599,7 @@ impl App {
             f,
             main_layout[1],
             self.agent_running,
+            self.working_start.map(|s| s.elapsed()),
             self.current_turn,
             &self.styles,
         );
@@ -643,11 +674,19 @@ fn shorten_path_for_display(path: &str) -> String {
     }
 }
 
+/// Return a spinning character based on elapsed time (cycles every ~200ms).
+fn spinner_frame(elapsed: std::time::Duration) -> char {
+    const SPINNERS: &[char] = &['|', '/', '-', '\\'];
+    let ms = elapsed.as_millis() as usize;
+    SPINNERS[(ms / 200) % SPINNERS.len()]
+}
+
 // ── Tests ────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::types::ToolResult;
     use crate::ui::autocomplete::AutocompleteState;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -977,14 +1016,157 @@ mod tests {
 
         assert!(app.streaming_thinking.is_empty());
     }
+
+    // ── Text streaming (live markdown) ───────────────────────────────
+
+    #[test]
+    fn test_text_delta_accumulates_in_buffer() {
+        let mut app = make_test_app();
+        app.process_event_for_test(AgentEvent::TurnStart { turn: 1 });
+        app.process_event_for_test(AgentEvent::TextDelta {
+            text: "Hello ".into(),
+        });
+        app.process_event_for_test(AgentEvent::TextDelta {
+            text: "world".into(),
+        });
+        assert_eq!(app.streaming_buffer, "Hello world");
+    }
+
+    #[test]
+    fn test_text_delta_renders_in_chat() {
+        let mut app = make_test_app();
+        app.process_event_for_test(AgentEvent::TurnStart { turn: 1 });
+
+        // Before text, chat has "🤖 Assistant" + "…" = 2 lines
+        assert!(app.chat.line_count() >= 2);
+
+        // Send text — should replace "…" with markdown
+        app.process_event_for_test(AgentEvent::TextDelta {
+            text: "Hello **world**".into(),
+        });
+
+        // Chat should contain the rendered text
+        let all: String = app.chat_lines_as_string();
+        assert!(
+            all.contains("Hello"),
+            "chat should contain streamed text, got: {all}"
+        );
+        assert!(all.contains("world"));
+    }
+
+    #[test]
+    fn test_placeholder_replaced_on_first_text() {
+        let mut app = make_test_app();
+        app.process_event_for_test(AgentEvent::TurnStart { turn: 1 });
+
+        // "…" placeholder should be in chat
+        let before: String = app.chat_lines_as_string();
+        assert!(
+            before.contains("…"),
+            "should have placeholder, got: {before}"
+        );
+
+        // First text should replace the placeholder
+        app.process_event_for_test(AgentEvent::TextDelta {
+            text: "analysis".into(),
+        });
+
+        let after: String = app.chat_lines_as_string();
+        assert!(
+            !after.contains('…'),
+            "placeholder should be gone, got: {after}"
+        );
+        assert!(after.contains("analysis"));
+    }
+
+    // ── Tool preview in chat ─────────────────────────────────────────
+
+    #[test]
+    fn test_tool_preview_appears_in_chat() {
+        let mut app = make_test_app();
+        app.process_event_for_test(AgentEvent::TurnStart { turn: 1 });
+
+        // Simulate a tool call
+        app.process_event_for_test(AgentEvent::ToolStart {
+            id: "t1".into(),
+            name: "edit".into(),
+        });
+        app.process_event_for_test(AgentEvent::ToolEnd {
+            id: "t1".into(),
+            arguments:
+                r#"{"file_path":"src/main.rs","old_string":"hello","new_string":"hello world"}"#
+                    .into(),
+        });
+
+        let all: String = app.chat_lines_as_string();
+        assert!(all.contains("🔧"), "should show tool indicator");
+        assert!(
+            all.contains("src/main.rs"),
+            "should show file path in preview"
+        );
+        assert!(all.contains("→"), "should show edit arrow in preview");
+    }
+
+    #[test]
+    fn test_working_indicator_appears_on_tool_end() {
+        let mut app = make_test_app();
+        app.process_event_for_test(AgentEvent::TurnStart { turn: 1 });
+        app.process_event_for_test(AgentEvent::ToolStart {
+            id: "t2".into(),
+            name: "bash".into(),
+        });
+        app.process_event_for_test(AgentEvent::ToolEnd {
+            id: "t2".into(),
+            arguments: r#"{"command":"cargo test"}"#.into(),
+        });
+
+        let all = app.chat_lines_as_string();
+        assert!(all.contains("Working"), "should show working indicator");
+        assert!(
+            all.contains("cargo test"),
+            "preview should still be visible"
+        );
+    }
+
+    #[test]
+    fn test_working_indicator_removed_on_result() {
+        let mut app = make_test_app();
+        app.process_event_for_test(AgentEvent::TurnStart { turn: 1 });
+        app.process_event_for_test(AgentEvent::ToolStart {
+            id: "t3".into(),
+            name: "bash".into(),
+        });
+        app.process_event_for_test(AgentEvent::ToolEnd {
+            id: "t3".into(),
+            arguments: r#"{"command":"cargo build"}"#.into(),
+        });
+        app.process_event_for_test(AgentEvent::ToolResult {
+            id: "t3".into(),
+            result: ToolResult {
+                success: true,
+                result: None,
+                images: vec![],
+                ui_summary: Some("build succeeded".into()),
+                ui_details: None,
+                ui_details_full: None,
+                file_changes: None,
+            },
+        });
+
+        let all = app.chat_lines_as_string();
+        assert!(!all.contains("Working"), "working indicator should be gone");
+        assert!(all.contains("✓"), "should show success checkmark");
+        assert!(
+            all.contains("build succeeded"),
+            "should show result summary"
+        );
+    }
 }
 
 /// Test-only helper to process a single event.
 #[cfg(test)]
 impl App {
     fn process_event_for_test(&mut self, event: AgentEvent) {
-        // Manually dispatch the event by feeding it into the event channel
-        // and calling process_events. A simpler approach: manually match.
         match event {
             AgentEvent::TurnStart { turn } => {
                 self.current_turn = turn;
@@ -993,12 +1175,45 @@ impl App {
                 self.streaming_mark = self.chat.line_count();
                 self.chat
                     .add_line(format!("  🤖 Assistant (turn {turn})"), &self.styles);
+                self.chat.add_styled_line("  …", self.styles.dim_text());
             }
             AgentEvent::ThinkingDelta { text, .. } => {
                 self.streaming_thinking.push_str(&text);
                 self.redraw_streaming();
             }
+            AgentEvent::TextDelta { text } => {
+                self.streaming_buffer.push_str(&text);
+                self.redraw_streaming();
+            }
+            AgentEvent::ToolStart { id, name, .. } => {
+                self.chat.add_line(format!("  🔧 {name}"), &self.styles);
+                self.pending_tools.insert(id, name);
+            }
+            AgentEvent::ToolEnd { id, arguments, .. } => {
+                if let Some(name) = self.pending_tools.remove(&id)
+                    && let Some(preview) = format_tool_preview(&name, &arguments)
+                {
+                    self.chat
+                        .add_styled_line(&preview, self.styles.thinking_text());
+                    self.working_mark = Some(self.chat.line_count());
+                    self.working_start = Some(Instant::now());
+                    self.chat
+                        .add_line("  | Working (0.0s)…".to_string(), &self.styles);
+                }
+            }
+            AgentEvent::ToolResult { result, .. } => {
+                if let Some(mark) = self.working_mark.take() {
+                    self.chat.truncate_to(mark);
+                }
+                let block = render_tool_result("", "tool", &result, &self.styles);
+                self.chat.add_block(block);
+            }
             _ => {}
         }
+    }
+
+    /// Collect all chat line content into a single string for assertions.
+    fn chat_lines_as_string(&self) -> String {
+        self.chat.all_text()
     }
 }

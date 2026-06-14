@@ -128,11 +128,13 @@ impl<'a> TurnRunner<'a> {
         let mut in_text = false;
         let mut usage = Usage::default();
         let mut stop_reason = StopReason::Stop;
+        let mut chunk_count: u64 = 0;
 
         // Consume the stream
         loop {
             // Check cancel before blocking on stream
             if *cancel_rx.borrow() {
+                tracing::debug!("Turn cancelled during streaming");
                 return Err(KonError::Cancelled);
             }
 
@@ -144,11 +146,17 @@ impl<'a> TurnRunner<'a> {
                     }
                 }
                 _ = cancel_rx.changed() => {
+                    tracing::debug!("Turn cancelled during streaming");
                     return Err(KonError::Cancelled);
                 }
             };
 
             let part = part?;
+            chunk_count += 1;
+            #[allow(clippy::manual_is_multiple_of)]
+            if chunk_count % 50 == 0 {
+                tracing::debug!("Stream progress: {chunk_count} chunks received");
+            }
 
             match part {
                 StreamPart::ThinkingDelta { thinking, .. } => {
@@ -275,6 +283,14 @@ impl<'a> TurnRunner<'a> {
 
         let tool_calls: Vec<BufferedToolCall> = tool_buffers.into_values().collect();
 
+        tracing::info!(
+            "Stream complete: {} chunks, {} text blocks, {} tool calls, stop={:?}",
+            chunk_count,
+            content_blocks.len(),
+            tool_calls.len(),
+            stop_reason
+        );
+
         Ok((content_blocks, tool_calls, usage, stop_reason))
     }
 
@@ -292,6 +308,9 @@ impl<'a> TurnRunner<'a> {
             if *cancel_rx.borrow() {
                 return Err(KonError::Cancelled);
             }
+
+            let tool_name = tc.name.clone();
+            tracing::info!("Executing tool: {tool_name}");
 
             // Find the tool
             let tool = match self.tools.iter().find(|t| t.name() == tc.name) {
@@ -360,7 +379,38 @@ impl<'a> TurnRunner<'a> {
             }
 
             // Execute the tool
-            let tool_result = tool.execute(params, cancel_rx.clone()).await?;
+            let tool_result = match tool.execute(params, cancel_rx.clone()).await {
+                Ok(ok_tr) => ok_tr,
+                Err(e) => {
+                    tracing::warn!("Tool {} failed: {e}", tc.name);
+                    // Send a ToolResult event even on error so the UI unblocks
+                    let err_result = ToolResult {
+                        success: false,
+                        result: Some(e.to_string()),
+                        images: vec![],
+                        ui_summary: Some(format!("Tool error: {e}")),
+                        ui_details: None,
+                        ui_details_full: None,
+                        file_changes: None,
+                    };
+                    let _ = event_tx
+                        .send(AgentEvent::ToolResult {
+                            id: tc.id.clone(),
+                            result: err_result.clone(),
+                        })
+                        .await;
+                    results.push(ToolCallResult {
+                        tool_call_id: tc.id.clone(),
+                        tool_name: tc.name.clone(),
+                        result: Some(e.to_string()),
+                        images: vec![],
+                        file_changes: None,
+                        tool_result: err_result,
+                        approval_was_prompted: matches!(decision, PermissionDecision::Prompt),
+                    });
+                    continue;
+                }
+            };
 
             let _ = event_tx
                 .send(AgentEvent::ToolResult {
