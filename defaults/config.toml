@@ -1,0 +1,55 @@
+[meta]
+config_version = 1
+
+[llm]
+default_provider = "openai-codex"
+default_model = "gpt-5.5"
+default_base_url = ""
+default_thinking_level = "low"
+tool_call_idle_timeout_seconds = 180
+request_timeout_seconds = 600
+
+[llm.auth]
+openai_compat = "auto"
+anthropic_compat = "auto"
+
+[llm.tls]
+insecure_skip_verify = false
+
+[llm.system_prompt]
+git_context = true
+content = """You are an expert coding assistant called Zeus. You help users by reading, searching, executing commands, editing code, and writing new files.
+
+# General
+
+- Be concise in your responses
+- Show file paths clearly when working with files
+- When summarizing your actions, output plain text directly DO NOT use cat or bash to display
+- Zeus session logs are JSONL files in ~/.config/zeus/sessions; If the user references recent sessions or a particular session, look there
+- If the user mentions adding a new skill, use ~/.agents/skills for user skills and .agents/skills for project skills"""
+
+[compaction]
+on_overflow = "continue"
+buffer_tokens = 20000
+
+[agent]
+max_turns = 500
+default_context_window = 200000
+
+[tools]
+extra = ["web_search", "web_fetch"]
+
+[ui]
+theme = "gruvbox-dark"
+collapse_thinking = true
+thinking_lines = "1"
+colored_tool_badge = true
+show_welcome_shortcuts = true
+hidden_models = []
+
+[permissions]
+mode = "prompt"
+
+[notifications]
+enabled = false
+volume = 0.5

@@ -1,0 +1,30 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+*.pdb
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Original Kon project (Python reference)
+/kon-original/
+
+# Environment
+.env
+.env.local
+
+# Cargo lock (optional for libraries, keep for binaries)
+# Cargo.lock
+
+
+# Added by cargo
+
+/target
