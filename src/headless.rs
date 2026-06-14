@@ -60,12 +60,13 @@ async fn run_headless_inner(cli: Cli, prompt_arg: Option<String>) -> KonResult<i
     // Scope the read lock so it's dropped before awaits
     let (provider_config, system_prompt, extra_tools) = {
         let cfg = config.read();
-        let mut pc = ProviderConfig::new(
+        let pc = ProviderConfig::new(
             &cfg.llm.default_provider,
             &cfg.llm.default_model,
             &cli.api_key.unwrap_or_default(),
         );
         // Override base URL from config (or CLI, already merged)
+        let mut pc = pc; // rebind as mutable
         if !cfg.llm.default_base_url.is_empty() {
             pc.base_url = Some(cfg.llm.default_base_url.clone());
         }
@@ -77,6 +78,8 @@ async fn run_headless_inner(cli: Cli, prompt_arg: Option<String>) -> KonResult<i
         (pc, sp, tools)
     };
 
+    let continue_session = cli.continue_session;
+
     // Create provider (fall back to mock if real provider isn't available)
     let provider = match create_provider(&provider_config) {
         Ok(p) => p,
@@ -86,9 +89,22 @@ async fn run_headless_inner(cli: Cli, prompt_arg: Option<String>) -> KonResult<i
         }
     };
 
-    // Create an ephemeral session (no persistence in headless mode)
+    // Create or resume session
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let mut session = Session::new(cwd, system_prompt, extra_tools).await?;
+    let mut session = if continue_session {
+        match crate::session::most_recent_session() {
+            Some(path) => {
+                tracing::info!("Resuming session: {}", path.display());
+                Session::load(path).await?
+            }
+            None => {
+                tracing::info!("No previous session found — creating new one");
+                Session::new(cwd, system_prompt, extra_tools).await?
+            }
+        }
+    } else {
+        Session::new(cwd, system_prompt, extra_tools).await?
+    };
 
     // Create and run agent
     let agent = Agent::new(config, provider);

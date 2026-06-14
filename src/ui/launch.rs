@@ -33,7 +33,7 @@ pub async fn run_tui(cli: Cli) -> anyhow::Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     // Build the app
-    let mut app = build_app(config.clone()).await?;
+    let mut app = build_app(config.clone(), cli.continue_session).await?;
 
     // Main event loop
     let result = run_event_loop(&mut terminal, &mut app).await;
@@ -46,22 +46,35 @@ pub async fn run_tui(cli: Cli) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn build_app(config: Arc<RwLock<Config>>) -> anyhow::Result<App> {
-    let cfg = config.read();
+async fn build_app(config: Arc<RwLock<Config>>, continue_session: bool) -> anyhow::Result<App> {
+    let (provider, tools) = {
+        let cfg = config.read();
+        let provider_config =
+            ProviderConfig::new(&cfg.llm.default_provider, &cfg.llm.default_model, "");
+        let provider = create_provider(&provider_config).unwrap_or_else(|e| {
+            tracing::warn!("{e} — using mock provider");
+            create_provider(&ProviderConfig::new("mock", "mock", "")).unwrap()
+        });
+        let tools = tools_mod::core_tools();
+        (provider, tools)
+    };
 
-    // Create provider (fall back to mock)
-    let provider_config =
-        ProviderConfig::new(&cfg.llm.default_provider, &cfg.llm.default_model, "");
-    let provider = create_provider(&provider_config).unwrap_or_else(|e| {
-        tracing::warn!("{e} — using mock provider");
-        create_provider(&ProviderConfig::new("mock", "mock", "")).unwrap()
-    });
+    let session = if continue_session {
+        match crate::session::most_recent_session() {
+            Some(path) => {
+                tracing::info!("Resuming session: {}", path.display());
+                Some(crate::session::Session::load(path).await?)
+            }
+            None => {
+                tracing::info!("No previous session found — starting fresh");
+                None
+            }
+        }
+    } else {
+        None
+    };
 
-    let tools = tools_mod::core_tools();
-
-    drop(cfg);
-
-    Ok(App::new(config, provider, tools))
+    Ok(App::new(config, provider, tools, session))
 }
 
 async fn run_event_loop(

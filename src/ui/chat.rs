@@ -91,26 +91,18 @@ impl ChatLog {
         let total = self.lines.len();
         let scroll = (self.scroll as usize).min(total.saturating_sub(1));
 
-        // Take a generous window from the bottom so wrapping overflow is covered.
-        let window = (area.height as usize * 3).min(total).max(1);
-        let end = total.saturating_sub(scroll);
-        let start = end.saturating_sub(window);
-        // Ensure we always have at least one line
-        if start >= end {
-            return;
-        }
-
-        let slice: Vec<Line<'static>> = self.lines[start..end].to_vec();
-
-        // Build Paragraph once and query exact wrapped line count of the slice.
-        let p = Paragraph::new(slice)
+        // Build Paragraph and query its EXACT wrapped line count.
+        // This uses ratatui's internal wrapping algorithm, so it's always
+        // correct — no estimation error at narrow widths.
+        let p = Paragraph::new(self.lines.clone())
             .style(styles.base())
             .wrap(Wrap { trim: false });
-        let slice_visual = p.line_count(area.width) as u16;
+        let total_visual = p.line_count(area.width);
 
-        // Scroll the slice to show its bottom portion in the viewport.
-        // If the slice is short (e.g. first messages), show from top.
-        let offset = slice_visual.saturating_sub(area.height);
+        // Bottom offset: how many rows to skip to make the last `area.height`
+        // rows visible. Scroll = rows scrolled up from bottom.
+        let bottom = total_visual.saturating_sub(area.height as usize);
+        let offset = bottom.saturating_sub(scroll).min(u16::MAX as usize) as u16;
 
         let p = p.scroll((offset, 0u16));
         f.render_widget(p, area);
@@ -125,25 +117,143 @@ impl Default for ChatLog {
 
 #[cfg(test)]
 mod tests {
-    use ratatui::text::Line;
+    use super::*;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::layout::Rect;
+
+    fn make_chat(n: usize) -> ChatLog {
+        let mut chat = ChatLog::new();
+        let styles = crate::ui::styles::Styles::default_theme();
+        for i in 0..n {
+            chat.add_line(format!("line {i:04}"), &styles);
+        }
+        chat
+    }
+
+    /// Render the chat into a test terminal and return the visible lines.
+    fn render_chat(chat: &ChatLog, width: u16, height: u16) -> Vec<String> {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                let area = Rect::new(0, 0, width, height);
+                chat.render(f, area, &crate::ui::styles::Styles::default_theme());
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let mut lines = Vec::new();
+        for y in 0..height {
+            let row: String = (0..width)
+                .map(|x| buffer[(x, y)].symbol().to_string())
+                .collect();
+            lines.push(row);
+        }
+        lines
+    }
 
     #[test]
-    fn test_line_count_reasonable() {
-        use ratatui::widgets::{Paragraph, Wrap};
-        // Simulate a chat with 20 lines of ~60 chars each
-        let lines: Vec<Line> = (0..20)
-            .map(|i| {
-                Line::from(format!(
-                    "  This is chat line number {i} with some extra text to make it longer"
-                ))
-            })
-            .collect();
-        let p = Paragraph::new(lines).wrap(Wrap { trim: false });
+    fn test_scroll_bottom_shows_last_lines() {
+        let chat = make_chat(100);
+        let lines = render_chat(&chat, 80, 20);
+        // At bottom (scroll=0), we should see the last few lines
+        let has_last = lines.iter().any(|l| l.contains("0099"));
+        assert!(
+            has_last,
+            "at bottom (scroll=0), should see line 99. Got:\n{}",
+            lines.join("\n")
+        );
+    }
+
+    #[test]
+    fn test_scroll_up_shows_earlier_lines() {
+        let mut chat = make_chat(100);
+        chat.scroll = 50; // scroll up 50 rows from bottom
+        let lines = render_chat(&chat, 80, 20);
+        // With scroll=50, we should see lines ~30-49 (50 rows above bottom)
+        let has_early = lines.iter().any(|l| l.contains("0030"));
+        assert!(
+            has_early,
+            "scroll=50 should show line ~30. Got:\n{}",
+            lines.join("\n")
+        );
+        // Should NOT see the last line (99)
+        let has_last = lines.iter().any(|l| l.contains("0099"));
+        assert!(
+            !has_last,
+            "scroll=50 should NOT show last line. Got:\n{}",
+            lines.join("\n")
+        );
+    }
+
+    #[test]
+    fn test_scroll_to_top_shows_first_lines() {
+        let mut chat = make_chat(50);
+        chat.scroll = 80; // scroll past all content
+        let lines = render_chat(&chat, 80, 20);
+        let has_first = lines.iter().any(|l| l.contains("0000"));
+        assert!(
+            has_first,
+            "at top, should see line 0. Got:\n{}",
+            lines.join("\n")
+        );
+    }
+
+    #[test]
+    fn test_never_shows_blank_when_content_exists() {
+        for scroll in [0u16, 1, 3, 5, 10, 100] {
+            let mut chat = make_chat(5);
+            chat.scroll = scroll;
+            let lines = render_chat(&chat, 80, 20);
+            let has_content = lines.iter().any(|l| !l.trim().is_empty());
+            assert!(
+                has_content,
+                "scroll={scroll}: should show content, not blank.\nGot:\n{}",
+                lines.join("\n")
+            );
+        }
+    }
+
+    #[test]
+    fn test_wrapping_long_lines() {
+        let mut chat = ChatLog::new();
+        let styles = crate::ui::styles::Styles::default_theme();
+        // One very long line that should wrap to multiple visual rows
+        chat.add_line(format!("{}", "=".repeat(200)), &styles);
+        chat.add_line("bottom line".to_string(), &styles);
+
+        // Render at width 40 — the long line should wrap to 5 rows (200/40)
+        let lines = render_chat(&chat, 40, 8);
+        let has_bottom = lines.iter().any(|l| l.contains("bottom"));
+        assert!(
+            has_bottom,
+            "bottom line should be visible. Got:\n{}",
+            lines.join("\n")
+        );
+    }
+
+    #[test]
+    fn test_line_count_at_least_line_count() {
+        // Paragraph::line_count(width) should be >= number of logical lines
+        // (each line takes at least 1 visual row)
+        let chat = make_chat(100);
+        let p = Paragraph::new(chat.lines.clone()).wrap(Wrap { trim: false });
         let count = p.line_count(80);
-        // Each line is ~65 chars. At width 80, each is 1 row → 20 rows
-        // (or maybe more if wrapping happens at different boundaries)
-        println!("line_count at width 80: {count}");
-        assert!(count >= 20, "line_count ({count}) should be at least 20");
-        assert!(count <= 80, "line_count ({count}) should be reasonable");
+        assert!(count >= 100, "line_count {count} should be >= 100");
+        // Should not be wildly inflated either
+        assert!(count <= 200, "line_count {count} should be reasonable");
+    }
+
+    #[test]
+    fn test_line_count_at_narrow_width() {
+        let chat = make_chat(20);
+        let p = Paragraph::new(chat.lines.clone()).wrap(Wrap { trim: false });
+        let count_wide = p.line_count(80);
+        let count_narrow = p.line_count(20);
+        // At narrow width, long lines wrap → more visual rows
+        assert!(
+            count_narrow >= count_wide,
+            "narrow ({count_narrow}) should be >= wide ({count_wide})"
+        );
     }
 }

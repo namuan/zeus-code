@@ -70,6 +70,7 @@ impl App {
         config: Arc<RwLock<Config>>,
         provider: Box<dyn Provider>,
         tools: Vec<Box<dyn Tool>>,
+        session: Option<Session>,
     ) -> Self {
         let (event_tx, event_rx) = mpsc::channel(128);
         let (cancel_tx, cancel_rx) = watch::channel(false);
@@ -86,7 +87,7 @@ impl App {
             current_turn: 0,
             total_tokens: 0,
             streaming_mark: 0,
-            session: Arc::new(parking_lot::Mutex::new(None)),
+            session: Arc::new(parking_lot::Mutex::new(session)),
             event_tx,
             event_rx,
             cancel_tx,
