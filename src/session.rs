@@ -406,6 +406,55 @@ impl Session {
         }
         self.tree = tree;
     }
+
+    /// Create a new session using synchronous std::fs I/O (safe to call from TUI context).
+    pub fn new_sync(cwd: PathBuf, system_prompt: String, tools: Vec<String>) -> KonResult<Self> {
+        let id = Uuid::new_v4();
+        let timestamp = now_iso();
+        let file_path = session_path(&cwd, &id, &timestamp)?;
+
+        let header = SessionEntry::Header {
+            version: 1,
+            id: id.to_string(),
+            timestamp: timestamp.clone(),
+            cwd: cwd.display().to_string(),
+            system_prompt: system_prompt.clone(),
+            tools: tools.clone(),
+            initial_thinking_level: "low".into(),
+        };
+
+        // Ensure directory exists (sync)
+        if let Some(parent) = file_path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                KonError::Session(format!(
+                    "failed to create session dir {}: {e}",
+                    parent.display()
+                ))
+            })?;
+        }
+
+        // Write header (sync)
+        let line = serde_json::to_string(&header)
+            .map_err(|e| KonError::Session(format!("failed to serialize header: {e}")))?;
+        std::fs::write(&file_path, line + "\n")
+            .map_err(|e| KonError::Session(format!("failed to write session: {e}")))?;
+
+        let mut session = Self {
+            id,
+            file_path,
+            entries: vec![header],
+            cwd,
+            system_prompt,
+            active_tools: tools,
+            created_at: chrono::DateTime::parse_from_rfc3339(&timestamp)
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+            tree: ConversationTree::new(),
+        };
+        session.rebuild_tree();
+
+        Ok(session)
+    }
 }
 
 // ── Conversation tree ────────────────────────────────────────────────────

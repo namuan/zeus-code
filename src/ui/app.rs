@@ -213,12 +213,8 @@ impl App {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         drop(cfg);
 
-        // Create ephemeral session — persistence will be added in Phase 10
-        let session = tokio::runtime::Handle::current()
-            .block_on(async { Session::new(cwd, sp, vec![]).await })
-            .unwrap_or_else(|e| {
-                panic!("failed to create session: {e}");
-            });
+        let session = Session::new_sync(cwd, sp, vec![])
+            .unwrap_or_else(|e| panic!("failed to create session: {e}"));
 
         Agent::new(self.config.clone(), provider, session)
     }
