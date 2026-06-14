@@ -56,6 +56,9 @@ pub struct App {
     /// Replaced with live markdown rendering on each TextDelta.
     streaming_buffer: String,
 
+    /// Accumulated thinking text for the current turn (shown dimmed).
+    streaming_thinking: String,
+
     /// The current conversation session (persisted across turns).
     /// Wrapped for safe sharing between the TUI thread and agent tasks.
     session: Arc<parking_lot::Mutex<Option<Session>>>,
@@ -98,6 +101,7 @@ impl App {
             total_tokens: 0,
             streaming_mark: 0,
             streaming_buffer: String::new(),
+            streaming_thinking: String::new(),
             session: Arc::new(parking_lot::Mutex::new(session)),
             event_tx,
             event_rx,
@@ -345,6 +349,31 @@ impl App {
         drop(session_guard);
     }
 
+    /// Redraw the streaming portion of the chat (thinking + text).
+    fn redraw_streaming(&mut self) {
+        self.chat.truncate_to(self.streaming_mark);
+
+        // Render thinking text (if any) as dimmed italic
+        if !self.streaming_thinking.is_empty() {
+            let thinking_style = self.styles.thinking_text();
+            self.chat.add_styled_line("  💭 Thinking…", thinking_style);
+            for line in self.streaming_thinking.lines() {
+                self.chat
+                    .add_styled_line(&format!("  {line}"), thinking_style);
+            }
+            self.chat.add_styled_line("", self.styles.base());
+        }
+
+        // Render streaming text as live markdown
+        if !self.streaming_buffer.is_empty() {
+            self.chat.replace_streaming_lines(
+                self.chat.line_count(),
+                &self.streaming_buffer,
+                &self.styles,
+            );
+        }
+    }
+
     // ── Autocomplete helpers ─────────────────────────────────────────
 
     /// Activate the file autocomplete popup for the `@` trigger.
@@ -449,19 +478,19 @@ impl App {
                 AgentEvent::TurnStart { turn } => {
                     self.current_turn = turn;
                     self.streaming_buffer.clear();
+                    self.streaming_thinking.clear();
                     // Record current line count so we can trim streaming text later
                     self.streaming_mark = self.chat.line_count();
                     self.chat
                         .add_line(format!("  🤖 Assistant (turn {turn})"), &self.styles);
                 }
-                AgentEvent::ThinkingDelta { .. } => {}
+                AgentEvent::ThinkingDelta { text: thinking, .. } => {
+                    self.streaming_thinking.push_str(&thinking);
+                    self.redraw_streaming();
+                }
                 AgentEvent::TextDelta { text } => {
                     self.streaming_buffer.push_str(&text);
-                    self.chat.replace_streaming_lines(
-                        self.streaming_mark,
-                        &self.streaming_buffer,
-                        &self.styles,
-                    );
+                    self.redraw_streaming();
                 }
                 AgentEvent::ToolStart { name, .. } => {
                     self.chat.add_line(format!("  🔧 {name}"), &self.styles);

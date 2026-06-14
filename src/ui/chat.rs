@@ -34,6 +34,12 @@ impl ChatLog {
             .push(Line::from(Span::styled(line, styles.base())));
     }
 
+    /// Push a line with a specific style (bypasses the default base style).
+    pub fn add_styled_line(&mut self, text: &str, style: ratatui::style::Style) {
+        self.lines
+            .push(Line::from(Span::styled(text.to_string(), style)));
+    }
+
     pub fn append_text(&mut self, text: &str, styles: &Styles) {
         if let Some(last) = self.lines.last_mut() {
             let current: String = last.spans.iter().map(|s| s.content.as_ref()).collect();
