@@ -194,15 +194,17 @@ impl AutocompleteState {
 
 // ── File collection ──────────────────────────────────────────────────
 
-/// Max number of files to collect (avoid memory issues in giant repos).
-const MAX_FILES: usize = 5000;
+/// Max number of entries to collect (avoid memory issues in giant repos).
+const MAX_ENTRIES: usize = 5000;
 
-/// Collect relative file paths from the current working directory,
+/// Collect relative paths from the current working directory,
 /// respecting `.gitignore` rules.
+/// Directories are suffixed with `/` so they sort above and are visually
+/// distinct from files.
 pub fn collect_project_files() -> Vec<String> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
-    let mut files: Vec<String> = Vec::with_capacity(1024);
+    let mut entries: Vec<String> = Vec::with_capacity(1024);
 
     let walker = ignore::WalkBuilder::new(&cwd)
         .standard_filters(true) // respect .gitignore, .ignore, etc.
@@ -213,17 +215,21 @@ pub fn collect_project_files() -> Vec<String> {
         .build();
 
     for entry in walker {
-        if files.len() >= MAX_FILES {
+        if entries.len() >= MAX_ENTRIES {
             break;
         }
         match entry {
             Ok(entry) => {
-                if entry.file_type().is_some_and(|ft| ft.is_file())
-                    && let Ok(rel) = entry.path().strip_prefix(&cwd)
-                {
+                let ft = entry.file_type();
+                if let Ok(rel) = entry.path().strip_prefix(&cwd) {
                     let s = rel.to_string_lossy().to_string();
-                    if !s.is_empty() {
-                        files.push(s);
+                    if s.is_empty() {
+                        continue;
+                    }
+                    if ft.is_some_and(|ft| ft.is_dir()) {
+                        entries.push(format!("{s}/"));
+                    } else if ft.is_some_and(|ft| ft.is_file()) {
+                        entries.push(s);
                     }
                 }
             }
@@ -231,7 +237,7 @@ pub fn collect_project_files() -> Vec<String> {
         }
     }
 
-    files
+    entries
 }
 
 /// Filter candidates by the given substring (case-insensitive).
@@ -250,15 +256,36 @@ pub fn filter_candidates(candidates: &[String], filter: &str) -> Vec<String> {
         .cloned()
         .collect();
 
-    // Sort: filename matches first, then by path length (shorter = higher)
+    // Sort: directory entries first, then paths with matching directory
+    // components, then filename matches, then shorter paths first.
     matches.sort_by(|a, b| {
-        let a_file_match = filename_contains(a, &lower);
-        let b_file_match = filename_contains(b, &lower);
-        match (a_file_match, b_file_match) {
-            (true, false) => std::cmp::Ordering::Less,
-            (false, true) => std::cmp::Ordering::Greater,
-            _ => a.len().cmp(&b.len()),
+        let a_is_dir = a.ends_with('/');
+        let b_is_dir = b.ends_with('/');
+        let a_dir = directory_contains(a, &lower);
+        let b_dir = directory_contains(b, &lower);
+        let a_file = filename_contains(a, &lower);
+        let b_file = filename_contains(b, &lower);
+
+        // Priority 1: actual directory entries
+        match (a_is_dir, b_is_dir) {
+            (true, false) => return std::cmp::Ordering::Less,
+            (false, true) => return std::cmp::Ordering::Greater,
+            _ => {}
         }
+        // Priority 2: matching directory components in path
+        match (a_dir, b_dir) {
+            (true, false) => return std::cmp::Ordering::Less,
+            (false, true) => return std::cmp::Ordering::Greater,
+            _ => {}
+        }
+        // Priority 3: filename matches
+        match (a_file, b_file) {
+            (true, false) => return std::cmp::Ordering::Less,
+            (false, true) => return std::cmp::Ordering::Greater,
+            _ => {}
+        }
+        // Priority 4: shorter path first
+        a.len().cmp(&b.len())
     });
 
     matches
@@ -270,6 +297,16 @@ fn filename_contains(path: &str, filter: &str) -> bool {
         .file_name()
         .and_then(|n| n.to_str())
         .is_some_and(|name| name.to_lowercase().contains(filter))
+}
+
+/// Check whether any *directory* component of a path contains `filter`.
+fn directory_contains(path: &str, filter: &str) -> bool {
+    Path::new(path).parent().is_some_and(|parent| {
+        parent
+            .components()
+            .filter_map(|c| c.as_os_str().to_str())
+            .any(|comp| comp.to_lowercase().contains(filter))
+    })
 }
 
 // ── Tests ────────────────────────────────────────────────────────────
@@ -444,19 +481,51 @@ mod tests {
 
     #[test]
     fn test_filter_candidates_prioritizes_filename_matches() {
-        // Scenario: typing "main" should surface files whose *filename*
-        // matches, even when alphabetically-sorted paths would bury them
-        // behind directory-name-only matches.
+        // Matching directories come first, then filename matches.
+        // Here neither candidate has a directory match, so filename
+        // match still wins.
         let candidates = vec![
-            "aaa_main/sub/file.rs".into(), // "main" in directory, filename = "file.rs"
-            "zzz/deep/nested/main.rs".into(), // "main" in filename = "main.rs"
+            "aaa_stuff/sub/file.rs".into(), // "main" not in directory or filename
+            "zzz/deep/nested/main.rs".into(), // "main" in filename
         ];
-        // "zzz/deep/nested/main.rs" IS a filename match → should come first
+        // Only "zzz/deep/nested/main.rs" matches "main" at all
         let result = filter_candidates(&candidates, "main");
-        assert_eq!(result.len(), 2, "both candidates contain 'main'");
+        assert_eq!(result.len(), 1, "only one candidate contains 'main'");
+        assert!(result[0].ends_with("main.rs"));
+    }
+
+    #[test]
+    fn test_filter_candidates_directory_before_filename() {
+        // Scenario: typing "main" matches both a directory entry and a
+        // file. The directory should appear first.
+        let candidates = vec![
+            "tools/main.rs".into(), // filename match
+            "src/main/".into(),     // directory entry
+        ];
+        let result = filter_candidates(&candidates, "main");
+        assert_eq!(result.len(), 2);
+        // Directory "src/main/" should be first
         assert!(
-            result[0].ends_with("main.rs"),
-            "filename match should rank first, got: {:?}",
+            result[0].ends_with('/'),
+            "directory entry should rank first, got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_filter_candidates_dir_component_before_filename() {
+        // When no actual directory entries exist, paths where "main" is
+        // in a directory component still beat pure filename matches.
+        let candidates = vec![
+            "tools/main.rs".into(),      // "main" in filename
+            "src/main/helper.rs".into(), // "main" in directory component
+        ];
+        let result = filter_candidates(&candidates, "main");
+        assert_eq!(result.len(), 2);
+        // Path with directory match should be first
+        assert!(
+            result[0].contains("/main/"),
+            "directory-component match should rank first, got: {:?}",
             result
         );
     }
