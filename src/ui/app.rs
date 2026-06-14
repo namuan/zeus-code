@@ -17,6 +17,7 @@ use crate::llm::providers::{ProviderConfig, create_provider};
 use crate::r#loop::Agent;
 use crate::session::Session;
 use crate::tools::base::Tool;
+use crate::ui::autocomplete::AutocompleteState;
 use crate::ui::blocks::{
     render_assistant_message, render_status, render_tool_result, render_user_message,
 };
@@ -39,6 +40,9 @@ pub struct App {
     // UI state
     pub chat: ChatLog,
     pub input: InputBox,
+    pub autocomplete: AutocompleteState,
+    /// Cached list of all project files (populated on first `@`).
+    all_files: Vec<String>,
     pub should_quit: bool,
     pub agent_running: bool,
     pub current_turn: u64,
@@ -82,6 +86,8 @@ impl App {
             styles: Styles::default_theme(),
             chat: ChatLog::new(),
             input: InputBox::new(),
+            autocomplete: AutocompleteState::inactive(),
+            all_files: Vec::new(),
             should_quit: false,
             agent_running: false,
             current_turn: 0,
@@ -100,6 +106,62 @@ impl App {
     /// Handle a key event from crossterm.
     pub fn handle_key(&mut self, key: crossterm::event::KeyEvent) {
         use crossterm::event::{KeyCode, KeyModifiers};
+
+        // ── Autocomplete is active: handle completion keys first ──────
+        if self.autocomplete.active {
+            // Ctrl+C, Ctrl+D, Ctrl+T — pass through to normal handler
+            if key.modifiers.contains(KeyModifiers::CONTROL) {
+                self.autocomplete.dismiss();
+                self.handle_key(key);
+                return;
+            }
+
+            match key.code {
+                // Tab / Enter: insert highlighted candidate, close popup
+                KeyCode::Tab | KeyCode::Enter => {
+                    self.apply_autocomplete();
+                    return;
+                }
+                // Esc: dismiss popup, keep text as-is
+                KeyCode::Esc => {
+                    self.autocomplete.dismiss();
+                    return;
+                }
+                // Up / Down: navigate candidates
+                KeyCode::Up => {
+                    self.autocomplete.select_prev();
+                    return;
+                }
+                KeyCode::Down => {
+                    self.autocomplete.select_next();
+                    return;
+                }
+                // Backspace: delete last char; if filter becomes empty, dismiss
+                KeyCode::Backspace => {
+                    self.input.backspace();
+                    self.after_autocomplete_char();
+                    return;
+                }
+                // Typing a character: insert and re-filter
+                KeyCode::Char(c) => {
+                    self.input.insert_char(c);
+                    self.after_autocomplete_char();
+                    return;
+                }
+                // Left / Right / Home / End still work for cursor positioning
+                KeyCode::Left => self.input.cursor_left(),
+                KeyCode::Right => self.input.cursor_right(),
+                KeyCode::Home => self.input.cursor_home(),
+                KeyCode::End => self.input.cursor_end(),
+                _ => {
+                    // Unknown key — dismiss autocomplete and let normal handler run
+                    self.autocomplete.dismiss();
+                    self.handle_key(key);
+                    return;
+                }
+            }
+            return;
+        }
 
         match key.code {
             // Quit: Ctrl+C (double-tap) or Ctrl+D
@@ -138,42 +200,9 @@ impl App {
             // Submit: Enter
             KeyCode::Enter => {
                 let text = self.input.submit();
-                if text.is_empty() {
-                    return;
+                if !text.is_empty() {
+                    self.handle_submit(&text);
                 }
-
-                // Check for slash commands
-                if let Some(cmd) = parse_command(&text) {
-                    match cmd {
-                        Command::Quit => self.should_quit = true,
-                        Command::Clear => self.chat.clear(),
-                        Command::Help => {
-                            let help = crate::ui::commands::help_text();
-                            self.chat
-                                .add_block(render_status(help, &self.styles, false));
-                        }
-                        Command::New => {
-                            self.chat.clear();
-                            self.chat.add_block(render_status(
-                                "Starting new conversation…",
-                                &self.styles,
-                                false,
-                            ));
-                        }
-                        _ => {
-                            self.chat.add_block(render_status(
-                                &format!("Command not yet implemented: {text}"),
-                                &self.styles,
-                                false,
-                            ));
-                        }
-                    }
-                    return;
-                }
-
-                // Regular input → run agent
-                self.chat.scroll_to_bottom();
-                self.run_agent(&text);
             }
 
             // Editing keys
@@ -189,7 +218,13 @@ impl App {
             KeyCode::End => self.input.cursor_end(),
             KeyCode::Up => self.input.history_prev(),
             KeyCode::Down => self.input.history_next(),
-            KeyCode::Char(c) => self.input.insert_char(c),
+            KeyCode::Char(c) => {
+                self.input.insert_char(c);
+                // Trigger file autocomplete on @
+                if c == '@' {
+                    self.activate_autocomplete();
+                }
+            }
 
             // Chat scrolling (PageUp / PageDown scroll by screenful)
             KeyCode::PageUp => self.chat.scroll_up(20),
@@ -256,6 +291,103 @@ impl App {
         drop(cfg);
 
         Agent::new(self.config.clone(), provider)
+    }
+
+    // ── Autocomplete helpers ─────────────────────────────────────────
+
+    /// Activate the file autocomplete popup for the `@` trigger.
+    fn activate_autocomplete(&mut self) {
+        let trigger_pos = self.input.cursor; // cursor is now after '@'
+        // Lazy-load the full file list (only on first activation)
+        if self.all_files.is_empty() {
+            self.all_files = crate::ui::autocomplete::collect_project_files();
+        }
+        let filter = "";
+        self.autocomplete = AutocompleteState::activate(trigger_pos, filter);
+    }
+
+    /// After a character is typed while autocomplete is active, update
+    /// the filter. Dismiss if the cursor moves past the trigger area.
+    fn after_autocomplete_char(&mut self) {
+        // Get the text after the trigger position
+        let text_after: &str = if self.autocomplete.trigger_pos <= self.input.text.len() {
+            &self.input.text[self.autocomplete.trigger_pos..]
+        } else {
+            self.autocomplete.dismiss();
+            return;
+        };
+
+        // Dismiss if the trigger character was deleted
+        if self.autocomplete.trigger_pos == 0 || self.input.text.is_empty() {
+            self.autocomplete.dismiss();
+            return;
+        }
+        let before = self.autocomplete.trigger_pos - 1;
+        if !self.input.text.is_char_boundary(before)
+            || self.input.text.as_bytes().get(before) != Some(&b'@')
+        {
+            self.autocomplete.dismiss();
+            return;
+        }
+
+        self.autocomplete.set_filter(text_after, &self.all_files);
+    }
+
+    /// Insert the highlighted candidate, replacing `@filter` in the input.
+    /// Appends a trailing space so the user can continue typing immediately.
+    fn apply_autocomplete(&mut self) {
+        if let Some(candidate) = self.autocomplete.selected_candidate() {
+            let mut candidate = candidate.to_string();
+            // Append a space so user can type instructions right after the file
+            candidate.push(' ');
+            // Calculate the byte range to replace: from @ to end of filter
+            let start = self.autocomplete.trigger_pos - 1; // position of '@'
+            let end = self.input.text.len(); // end of text
+            // Replace "@filter" with "candidate "
+            self.input.text.replace_range(start..end, &candidate);
+            self.input.cursor = start + candidate.len();
+        }
+        self.autocomplete.dismiss();
+    }
+
+    /// Handle submit logic extracted from key handler.
+    fn handle_submit(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+
+        // Check for slash commands
+        if let Some(cmd) = parse_command(text) {
+            match cmd {
+                Command::Quit => self.should_quit = true,
+                Command::Clear => self.chat.clear(),
+                Command::Help => {
+                    let help = crate::ui::commands::help_text();
+                    self.chat
+                        .add_block(render_status(help, &self.styles, false));
+                }
+                Command::New => {
+                    self.chat.clear();
+                    self.chat.add_block(render_status(
+                        "Starting new conversation…",
+                        &self.styles,
+                        false,
+                    ));
+                }
+                _ => {
+                    self.chat.add_block(render_status(
+                        &format!("Command not yet implemented: {text}"),
+                        &self.styles,
+                        false,
+                    ));
+                }
+            }
+            return;
+        }
+
+        // Regular input → run agent
+        self.chat.scroll_to_bottom();
+        self.run_agent(text);
     }
 
     /// Process agent events from the channel.
@@ -337,5 +469,231 @@ impl App {
 
         // Input box
         self.input.render(f, main_layout[2], &self.styles);
+
+        // Autocomplete popup (renders on top of everything)
+        self.autocomplete.render(f, &self.styles);
+    }
+}
+
+// ── Tests ────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ui::autocomplete::AutocompleteState;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    /// Create a minimal App for testing key handling.
+    /// Uses MockProvider and no real tools to keep tests fast.
+    fn make_test_app() -> App {
+        let config = Arc::new(RwLock::new(Config::load_defaults()));
+        let provider = create_provider(&ProviderConfig::new("mock", "mock", "")).unwrap();
+        let tools: Vec<Box<dyn Tool>> = vec![];
+        let session: Option<Session> = None;
+        App::new(config, provider, tools, session)
+    }
+
+    /// Press a key on the app.
+    fn press(app: &mut App, code: KeyCode) {
+        app.handle_key(KeyEvent::new(code, KeyModifiers::NONE));
+    }
+
+    /// Press a char on the app.
+    fn type_char(app: &mut App, c: char) {
+        app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+    }
+
+    // ── @ trigger ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_at_sign_activates_autocomplete() {
+        let mut app = make_test_app();
+        assert!(!app.autocomplete.active);
+
+        type_char(&mut app, '@');
+
+        assert!(app.autocomplete.active);
+        assert_eq!(app.input.text, "@");
+    }
+
+    // ── Tab inserts file, does NOT submit ─────────────────────────────
+
+    #[tokio::test]
+    async fn test_tab_inserts_file_without_submitting() {
+        let mut app = make_test_app();
+
+        // Manually put the app into autocomplete mode with a known candidate
+        app.input.text = "@mai".to_string();
+        app.input.cursor = 4;
+        let mut state = AutocompleteState::inactive();
+        state.active = true;
+        state.trigger_pos = 1; // after '@'
+        state.selected = 0;
+        // Simulate: candidates field is private, so use set_filter
+        app.all_files = vec!["src/main.rs".into(), "src/lib.rs".into()];
+        app.autocomplete = state;
+        app.autocomplete
+            .set_filter("mai", &["src/main.rs".into(), "src/lib.rs".into()]);
+
+        // Press Tab
+        press(&mut app, KeyCode::Tab);
+
+        // The highlighted candidate should have replaced "@mai"
+        assert!(
+            app.input.text.contains("src/main.rs"),
+            "expected file insertion, got: {}",
+            app.input.text
+        );
+        // Should end with a space so user can type instructions immediately
+        assert!(
+            app.input.text.ends_with(' '),
+            "expected trailing space after file, got: {:?}",
+            app.input.text
+        );
+        // Autocomplete should be dismissed
+        assert!(!app.autocomplete.active);
+        // Input should NOT have been submitted (text should still be present)
+        assert!(
+            !app.input.text.is_empty(),
+            "input should still have text after Tab"
+        );
+    }
+
+    // ── Enter inserts file, does NOT submit ───────────────────────────
+
+    #[tokio::test]
+    async fn test_enter_inserts_file_without_submitting() {
+        let mut app = make_test_app();
+
+        // Set up autocomplete with a candidate
+        app.input.text = "@lib".to_string();
+        app.input.cursor = 4;
+        let mut state = AutocompleteState::inactive();
+        state.active = true;
+        state.trigger_pos = 1;
+        state.selected = 0;
+        app.all_files = vec!["src/main.rs".into(), "src/lib.rs".into()];
+        app.autocomplete = state;
+        app.autocomplete
+            .set_filter("lib", &["src/main.rs".into(), "src/lib.rs".into()]);
+
+        // Press Enter
+        press(&mut app, KeyCode::Enter);
+
+        // Enter in autocomplete mode should insert the file, NOT submit
+        assert!(
+            app.input.text.contains("src/lib.rs"),
+            "expected file inserted, got: {}",
+            app.input.text
+        );
+        // Should end with a space so user can type instructions immediately
+        assert!(
+            app.input.text.ends_with(' '),
+            "expected trailing space after file, got: {:?}",
+            app.input.text
+        );
+        assert!(!app.autocomplete.active);
+        // Text should still be in the input box (not submitted)
+        assert!(
+            !app.input.text.is_empty(),
+            "Enter in autocomplete should NOT submit the message"
+        );
+    }
+
+    // ── Esc dismisses autocomplete ────────────────────────────────────
+
+    #[test]
+    fn test_esc_dismisses_autocomplete() {
+        let mut app = make_test_app();
+
+        // Activate autocomplete via @
+        type_char(&mut app, '@');
+        assert!(app.autocomplete.active);
+
+        // Press Esc
+        press(&mut app, KeyCode::Esc);
+
+        assert!(!app.autocomplete.active);
+        // Input text should be preserved
+        assert_eq!(app.input.text, "@");
+    }
+
+    // ── Esc with agent running cancels the agent ──────────────────────
+
+    #[test]
+    fn test_esc_clears_input_when_not_running() {
+        let mut app = make_test_app();
+        // No autocomplete active; not running
+        app.autocomplete.dismiss();
+        app.input.text = "hello".to_string();
+        app.input.cursor = 5;
+
+        press(&mut app, KeyCode::Esc);
+
+        // Without autocomplete or agent running, Esc clears the input
+        assert_eq!(app.input.text, "");
+        assert_eq!(app.input.cursor, 0);
+    }
+
+    // ── Enter submits when autocomplete is NOT active ─────────────────
+
+    #[tokio::test]
+    async fn test_enter_submits_when_autocomplete_inactive() {
+        let mut app = make_test_app();
+
+        // Set up input text WITHOUT autocomplete active
+        app.input.text = "hello world".to_string();
+        app.input.cursor = 11;
+        assert!(!app.autocomplete.active);
+
+        // Press Enter
+        press(&mut app, KeyCode::Enter);
+
+        // Input should be cleared (submit() was called)
+        assert_eq!(app.input.text, "");
+        assert_eq!(app.input.cursor, 0);
+    }
+
+    // ── Ctrl modifiers dismiss autocomplete before normal handling ────
+
+    #[test]
+    fn test_ctrl_c_dismisses_autocomplete() {
+        let mut app = make_test_app();
+
+        // Activate autocomplete
+        type_char(&mut app, '@');
+        assert!(app.autocomplete.active);
+
+        // Press Ctrl+C — should dismiss autocomplete and clear input
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+
+        assert!(!app.autocomplete.active);
+        assert_eq!(app.input.text, "");
+    }
+
+    // ── Autocomplete activates multiple times ─────────────────────────
+
+    #[test]
+    fn test_autocomplete_reactivates_on_second_at() {
+        let mut app = make_test_app();
+
+        // First @
+        type_char(&mut app, '@');
+        assert!(app.autocomplete.active);
+
+        // Dismiss
+        press(&mut app, KeyCode::Esc);
+        assert!(!app.autocomplete.active);
+
+        // Type some text
+        type_char(&mut app, 'h');
+        type_char(&mut app, 'i');
+        type_char(&mut app, ' ');
+
+        // Second @
+        type_char(&mut app, '@');
+        assert!(app.autocomplete.active);
+        // After "hi @" the second @ is at byte position 5
+        assert_eq!(app.autocomplete.trigger_pos, 5);
     }
 }
