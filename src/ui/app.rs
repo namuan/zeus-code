@@ -52,6 +52,10 @@ pub struct App {
     /// Used to trim streaming text and replace with formatted blocks on TurnEnd.
     streaming_mark: usize,
 
+    /// Accumulated streaming text for the current turn.
+    /// Replaced with live markdown rendering on each TextDelta.
+    streaming_buffer: String,
+
     /// The current conversation session (persisted across turns).
     /// Wrapped for safe sharing between the TUI thread and agent tasks.
     session: Arc<parking_lot::Mutex<Option<Session>>>,
@@ -93,6 +97,7 @@ impl App {
             current_turn: 0,
             total_tokens: 0,
             streaming_mark: 0,
+            streaming_buffer: String::new(),
             session: Arc::new(parking_lot::Mutex::new(session)),
             event_tx,
             event_rx,
@@ -396,6 +401,7 @@ impl App {
             match event {
                 AgentEvent::TurnStart { turn } => {
                     self.current_turn = turn;
+                    self.streaming_buffer.clear();
                     // Record current line count so we can trim streaming text later
                     self.streaming_mark = self.chat.line_count();
                     self.chat
@@ -403,7 +409,12 @@ impl App {
                 }
                 AgentEvent::ThinkingDelta { .. } => {}
                 AgentEvent::TextDelta { text } => {
-                    self.chat.append_text(&text, &self.styles);
+                    self.streaming_buffer.push_str(&text);
+                    self.chat.replace_streaming_lines(
+                        self.streaming_mark,
+                        &self.streaming_buffer,
+                        &self.styles,
+                    );
                 }
                 AgentEvent::ToolStart { name, .. } => {
                     self.chat.add_line(format!("  🔧 {name}"), &self.styles);

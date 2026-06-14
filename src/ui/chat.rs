@@ -63,6 +63,15 @@ impl ChatLog {
         self.lines.truncate(len);
     }
 
+    /// Replace all lines from `mark` onward with freshly rendered markdown.
+    /// Used during streaming to show partially-formatted text before
+    /// the final `TurnEnd` rendering kicks in.
+    pub fn replace_streaming_lines(&mut self, mark: usize, text: &str, styles: &Styles) {
+        self.lines.truncate(mark);
+        let rendered = crate::ui::markdown::render_markdown(text, "  ", styles);
+        self.lines.extend(rendered);
+    }
+
     /// Current number of lines in the chat.
     pub fn line_count(&self) -> usize {
         self.lines.len()
