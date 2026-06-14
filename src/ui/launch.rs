@@ -74,7 +74,10 @@ async fn build_app(config: Arc<RwLock<Config>>, continue_session: bool) -> anyho
         None
     };
 
-    Ok(App::new(config, provider, tools, session))
+    let mut app = App::new(config, provider, tools, session);
+    // If a session was restored, render its history into the chat
+    app.render_session_history();
+    Ok(app)
 }
 
 async fn run_event_loop(

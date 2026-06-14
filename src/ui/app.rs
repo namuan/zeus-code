@@ -298,6 +298,53 @@ impl App {
         Agent::new(self.config.clone(), provider)
     }
 
+    // ── Session history restore ───────────────────────────────────────
+
+    /// Render the active messages from the current session into the chat log.
+    /// Called once at startup when `--continue-session` is used.
+    pub fn render_session_history(&mut self) {
+        let session_guard = self.session.lock();
+        let Some(ref session) = *session_guard else {
+            return;
+        };
+
+        let messages = session.active_messages();
+        for msg in &messages {
+            match msg {
+                crate::core::types::Message::User(um) => {
+                    let text = extract_user_text(&um.content);
+                    let block = render_user_message(&text, um.skill_name.as_deref(), &self.styles);
+                    self.chat.add_line(String::new(), &self.styles);
+                    self.chat.add_block(block);
+                }
+                crate::core::types::Message::Assistant(am) => {
+                    for block in render_assistant_message(&am.content, &self.styles) {
+                        self.chat.add_block(block);
+                    }
+                    self.chat.add_separator(&self.styles);
+                }
+                crate::core::types::Message::ToolResult(tr) => {
+                    let tool_result = crate::core::types::ToolResult {
+                        success: true,
+                        result: Some(tr.content.clone()),
+                        images: tr.images.clone(),
+                        ui_summary: Some(tr.tool_name.clone()),
+                        ui_details: None,
+                        ui_details_full: None,
+                        file_changes: tr.file_changes.clone(),
+                    };
+                    let block = render_tool_result("", &tr.tool_name, &tool_result, &self.styles);
+                    self.chat.add_block(block);
+                }
+                crate::core::types::Message::System(sm) => {
+                    let block = render_status(&sm.content, &self.styles, false);
+                    self.chat.add_block(block);
+                }
+            }
+        }
+        drop(session_guard);
+    }
+
     // ── Autocomplete helpers ─────────────────────────────────────────
 
     /// Activate the file autocomplete popup for the `@` trigger.
@@ -484,6 +531,21 @@ impl App {
         // Autocomplete popup (renders on top of everything)
         self.autocomplete.render(f, &self.styles);
     }
+}
+
+/// Extract plain text from user message content blocks.
+fn extract_user_text(content: &[crate::core::types::ContentBlock]) -> String {
+    content
+        .iter()
+        .filter_map(|cb| {
+            if let crate::core::types::ContentBlock::Text { text } = cb {
+                Some(text.as_str())
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 // ── Tests ────────────────────────────────────────────────────────────
@@ -706,5 +768,40 @@ mod tests {
         assert!(app.autocomplete.active);
         // After "hi @" the second @ is at byte position 5
         assert_eq!(app.autocomplete.trigger_pos, 5);
+    }
+
+    // ── Continue session displays history ─────────────────────────────
+
+    #[tokio::test]
+    async fn test_continue_session_displays_user_message() {
+        let cwd = PathBuf::from("/tmp/test-continue-session-chat");
+        let _ = std::fs::create_dir_all(&cwd);
+        let mut session = Session::new(cwd, "sp".into(), vec![]).await.unwrap();
+        session
+            .append_user_message(crate::core::types::UserMessage {
+                content: vec![crate::core::types::ContentBlock::Text {
+                    text: "hello world".into(),
+                }],
+                skill_name: None,
+            })
+            .await
+            .unwrap();
+
+        let config = Arc::new(RwLock::new(Config::load_defaults()));
+        let provider = create_provider(&ProviderConfig::new("mock", "mock", "")).unwrap();
+        let tools: Vec<Box<dyn Tool>> = vec![];
+        let mut app = App::new(config, provider, tools, Some(session));
+
+        // Before restore, chat should be empty
+        assert_eq!(app.chat.line_count(), 0);
+
+        // Restore session history into chat
+        app.render_session_history();
+
+        // Chat should now contain the rendered user message
+        assert!(
+            app.chat.line_count() > 0,
+            "chat should display session history after restore"
+        );
     }
 }
