@@ -135,6 +135,35 @@ pub fn render_tool_result(
         ),
     ]));
 
+    // Render file diffs inline when present
+    if let Some(fc) = &result.file_changes
+        && let Some(diff) = fc.diff.clone()
+    {
+        // Blank line before diff
+        lines.push(Line::from(Span::styled("", styles.base())));
+        // Diff header
+        lines.push(Line::from(Span::styled(
+            format!("  ┌─ {} +{}/-{}", fc.path, fc.lines_added, fc.lines_removed),
+            styles.accent_text(),
+        )));
+        // Diff content with +/- coloring
+        for dline in diff.lines() {
+            let (marker, style) = if dline.starts_with('+') {
+                (" ", styles.success_text())
+            } else if dline.starts_with('-') {
+                (" ", styles.error_text())
+            } else {
+                (" ", styles.dim_text())
+            };
+            lines.push(Line::from(Span::styled(
+                format!("  │{marker}{dline}"),
+                style,
+            )));
+        }
+        // Diff footer
+        lines.push(Line::from(Span::styled("  └─", styles.accent_text())));
+    }
+
     let h = lines.len() as u16;
     MessageBlock { lines, height: h }
 }

@@ -135,7 +135,12 @@ impl Tool for WriteTool {
                 path: path.display().to_string(),
                 lines_added: lines_added as u64,
                 lines_removed: lines_removed as u64,
-                diff: None,
+                diff: old_content.as_ref().map(|old| {
+                    similar::TextDiff::from_lines(old.as_str(), content)
+                        .unified_diff()
+                        .context_radius(3)
+                        .to_string()
+                }),
             }),
         })
     }
