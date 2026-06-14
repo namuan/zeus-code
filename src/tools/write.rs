@@ -120,6 +120,25 @@ impl Tool for WriteTool {
         let action = if existed { "Overwrote" } else { "Created" };
         let summary = format!("{action} {} ({} lines)", shorten_path(path, 40), line_count);
 
+        // Diff computation can be expensive for large files
+        let diff_start = std::time::Instant::now();
+        let diff = old_content.as_ref().map(|old| {
+            similar::TextDiff::from_lines(old.as_str(), content)
+                .unified_diff()
+                .context_radius(3)
+                .to_string()
+        });
+        let diff_elapsed = diff_start.elapsed();
+        if diff_elapsed.as_millis() > 10 {
+            tracing::info!(
+                "Diff computed in {:.1}ms for {} ({}→{} lines)",
+                diff_elapsed.as_secs_f64() * 1000.0,
+                file_path,
+                old_lines,
+                line_count,
+            );
+        }
+
         Ok(ToolResult {
             success: true,
             result: Some(format!(
@@ -135,12 +154,7 @@ impl Tool for WriteTool {
                 path: path.display().to_string(),
                 lines_added: lines_added as u64,
                 lines_removed: lines_removed as u64,
-                diff: old_content.as_ref().map(|old| {
-                    similar::TextDiff::from_lines(old.as_str(), content)
-                        .unified_diff()
-                        .context_radius(3)
-                        .to_string()
-                }),
+                diff,
             }),
         })
     }

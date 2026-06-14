@@ -6,8 +6,8 @@ default_provider = "openai-codex"
 default_model = "gpt-5.5"
 default_base_url = ""
 default_thinking_level = "low"
-tool_call_idle_timeout_seconds = 180
-request_timeout_seconds = 600
+tool_call_idle_timeout_seconds = 60
+request_timeout_seconds = 120
 
 [llm.auth]
 openai_compat = "auto"

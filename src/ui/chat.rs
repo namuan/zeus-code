@@ -78,6 +78,13 @@ impl ChatLog {
         self.lines.extend(rendered);
     }
 
+    /// Replace the last line (used for progress indicators like
+    /// "N KB streaming…" during tool argument generation).
+    pub fn set_progress_line(&mut self, text: String, styles: &Styles) {
+        self.lines.pop();
+        self.add_line(text, styles);
+    }
+
     /// Current number of lines in the chat.
     pub fn line_count(&self) -> usize {
         self.lines.len()

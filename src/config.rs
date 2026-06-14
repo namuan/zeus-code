@@ -387,8 +387,8 @@ mod tests {
         assert_eq!(config.llm.default_provider, "openai-codex");
         assert_eq!(config.llm.default_model, "gpt-5.5");
         assert_eq!(config.llm.default_thinking_level, "low");
-        assert_eq!(config.llm.tool_call_idle_timeout_seconds, 180);
-        assert_eq!(config.llm.request_timeout_seconds, 600);
+        assert_eq!(config.llm.tool_call_idle_timeout_seconds, 60);
+        assert_eq!(config.llm.request_timeout_seconds, 120);
         assert_eq!(config.llm.auth.openai_compat, "auto");
         assert_eq!(config.llm.auth.anthropic_compat, "auto");
         assert!(!config.llm.tls.insecure_skip_verify);

@@ -379,10 +379,25 @@ impl<'a> TurnRunner<'a> {
             }
 
             // Execute the tool
+            let exec_start = std::time::Instant::now();
             let tool_result = match tool.execute(params, cancel_rx.clone()).await {
-                Ok(ok_tr) => ok_tr,
+                Ok(ok_tr) => {
+                    let elapsed = exec_start.elapsed();
+                    tracing::info!(
+                        "Tool {} completed in {:.1}s (success={})",
+                        tc.name,
+                        elapsed.as_secs_f64(),
+                        ok_tr.success
+                    );
+                    ok_tr
+                }
                 Err(e) => {
-                    tracing::warn!("Tool {} failed: {e}", tc.name);
+                    let elapsed = exec_start.elapsed();
+                    tracing::warn!(
+                        "Tool {} failed after {:.1}s: {e}",
+                        tc.name,
+                        elapsed.as_secs_f64()
+                    );
                     // Send a ToolResult event even on error so the UI unblocks
                     let err_result = ToolResult {
                         success: false,

@@ -46,6 +46,10 @@ pub struct App {
 
     /// Tool call ID → tool name, used to render a preview when ToolEnd fires.
     pending_tools: std::collections::HashMap<String, String>,
+    /// Tool call ID → accumulated argument bytes, for streaming progress.
+    args_bytes: std::collections::HashMap<String, usize>,
+    /// Line mark for replacing the argument progress line during ToolArgsDelta.
+    args_progress_mark: Option<usize>,
     pub should_quit: bool,
     pub agent_running: bool,
     pub current_turn: u64,
@@ -61,6 +65,9 @@ pub struct App {
 
     /// When the current tool started executing (for elapsed-time display).
     working_start: Option<Instant>,
+
+    /// When the current turn began waiting for content (for connecting indicator).
+    connecting_start: Option<Instant>,
 
     /// Accumulated streaming text for the current turn.
     /// Replaced with live markdown rendering on each TextDelta.
@@ -106,6 +113,8 @@ impl App {
             autocomplete: AutocompleteState::inactive(),
             all_files: Vec::new(),
             pending_tools: std::collections::HashMap::new(),
+            args_bytes: std::collections::HashMap::new(),
+            args_progress_mark: None,
             should_quit: false,
             agent_running: false,
             current_turn: 0,
@@ -115,6 +124,7 @@ impl App {
             streaming_thinking: String::new(),
             working_mark: None,
             working_start: None,
+            connecting_start: None,
             session: Arc::new(parking_lot::Mutex::new(session)),
             event_tx,
             event_rx,
@@ -487,7 +497,9 @@ impl App {
 
     /// Process agent events from the channel.
     pub fn process_events(&mut self) {
+        let mut event_count = 0u64;
         while let Ok(event) = self.event_rx.try_recv() {
+            event_count += 1;
             match event {
                 AgentEvent::TurnStart { turn } => {
                     self.current_turn = turn;
@@ -499,24 +511,49 @@ impl App {
                         .add_line(format!("  🤖 Assistant (turn {turn})"), &self.styles);
                     // Show a placeholder so the user knows the assistant is working
                     self.chat.add_styled_line("  …", self.styles.dim_text());
+                    self.connecting_start = Some(Instant::now());
                 }
                 AgentEvent::ThinkingDelta { text: thinking, .. } => {
+                    self.connecting_start = None;
                     self.streaming_thinking.push_str(&thinking);
                     self.redraw_streaming();
                 }
                 AgentEvent::TextDelta { text } => {
+                    self.connecting_start = None;
                     self.streaming_buffer.push_str(&text);
                     self.redraw_streaming();
                 }
                 AgentEvent::ToolStart { name, id, .. } => {
+                    self.connecting_start = None;
                     self.chat.add_line(format!("  🔧 {name}"), &self.styles);
+                    // Mark where to place the argument streaming progress
+                    self.args_progress_mark = Some(self.chat.line_count());
+                    self.chat.add_line(String::new(), &self.styles);
                     // Track this tool for preview rendering
                     self.pending_tools.insert(id, name);
                 }
-                AgentEvent::ToolArgsDelta { .. } => {
-                    // Args accumulate in ToolEnd; we render from the full JSON there
+                AgentEvent::ToolArgsDelta { id, ref delta } => {
+                    // Show streaming argument size so the user sees progress
+                    // while the LLM generates large tool call arguments
+                    let entry = self.args_bytes.entry(id.clone()).or_insert(0);
+                    *entry += delta.len();
+                    let kb = *entry as f64 / 1024.0;
+                    if let Some(mark) = self.args_progress_mark {
+                        let label = if kb >= 1.0 {
+                            format!("     ({kb:.1} KB streaming)…")
+                        } else {
+                            format!("     ({} B streaming)…", entry)
+                        };
+                        self.chat.truncate_to(mark);
+                        self.chat.add_line(label, &self.styles);
+                    }
                 }
                 AgentEvent::ToolEnd { id, arguments, .. } => {
+                    // Clean up the progress counter and mark
+                    self.args_bytes.remove(&id);
+                    if let Some(mark) = self.args_progress_mark.take() {
+                        self.chat.truncate_to(mark);
+                    }
                     if let Some(name) = self.pending_tools.remove(&id)
                         && let Some(preview) = format_tool_preview(&name, &arguments)
                     {
@@ -552,6 +589,7 @@ impl App {
                     self.total_tokens += usage.input_tokens + usage.output_tokens;
                     self.agent_running = false;
                     self.working_start = None;
+                    self.connecting_start = None;
                     self.chat.add_line(
                         format!(
                             "  ✓ Done in {total_turns} turns ({} tok)",
@@ -563,11 +601,18 @@ impl App {
                 AgentEvent::Error { error } => {
                     self.agent_running = false;
                     self.working_start = None;
+                    self.connecting_start = None;
                     self.chat
                         .add_line(format!("  ✗ Error: {error}"), &self.styles);
                 }
+
                 _ => {}
             }
+        }
+
+        // Log event processing activity
+        if event_count > 0 {
+            tracing::info!("Processed {event_count} agent events");
         }
 
         // Animate the working indicator while a tool is executing
@@ -577,6 +622,16 @@ impl App {
             let text = format!("  {spinner} Working ({:.1}s)…", elapsed.as_secs_f64());
             self.chat.truncate_to(mark);
             self.chat.add_line(text, &self.styles);
+        }
+
+        // Animate the connecting placeholder while waiting for first response
+        if let Some(start) = self.connecting_start {
+            let mark = self.streaming_mark + 1; // after "🤖 Assistant (turn N)"
+            let elapsed = start.elapsed();
+            let spinner = spinner_frame(elapsed);
+            let text = format!("  {spinner} Connecting… ({:.0}s)", elapsed.as_secs_f64());
+            self.chat.truncate_to(mark);
+            self.chat.add_styled_line(&text, self.styles.dim_text());
         }
     }
 
@@ -1187,9 +1242,13 @@ impl App {
             }
             AgentEvent::ToolStart { id, name, .. } => {
                 self.chat.add_line(format!("  🔧 {name}"), &self.styles);
+                self.args_progress_mark = Some(self.chat.line_count());
+                self.chat.add_line(String::new(), &self.styles);
                 self.pending_tools.insert(id, name);
             }
             AgentEvent::ToolEnd { id, arguments, .. } => {
+                self.args_bytes.remove(&id);
+                self.args_progress_mark = None;
                 if let Some(name) = self.pending_tools.remove(&id)
                     && let Some(preview) = format_tool_preview(&name, &arguments)
                 {

@@ -84,6 +84,8 @@ async fn run_event_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App,
 ) -> anyhow::Result<()> {
+    let mut iteration: u64 = 0;
+    let mut last_log = std::time::Instant::now();
     loop {
         // Process agent events
         app.process_events();
@@ -106,6 +108,17 @@ async fn run_event_loop(
                 }
                 _ => {}
             }
+        }
+
+        iteration += 1;
+        if last_log.elapsed().as_millis() > 1000 {
+            tracing::info!(
+                "TUI loop: {} iters/sec, agent_running={}",
+                iteration,
+                app.agent_running
+            );
+            last_log = std::time::Instant::now();
+            iteration = 0;
         }
     }
 
