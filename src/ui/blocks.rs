@@ -189,3 +189,89 @@ fn truncate_args(args: &str, max_len: usize) -> String {
         format!("{}…", &one_line[..max_len - 1])
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::types::FileChanges;
+
+    fn test_styles() -> Styles {
+        Styles::default_theme()
+    }
+
+    #[test]
+    fn test_render_tool_result_without_diff() {
+        let result = ToolResult {
+            success: true,
+            result: Some("done".into()),
+            images: vec![],
+            ui_summary: Some("Created file.txt".into()),
+            ui_details: None,
+            ui_details_full: None,
+            file_changes: None,
+        };
+        let block = render_tool_result("x", "write", &result, &test_styles());
+        // Should have just the summary line (no diff)
+        assert_eq!(block.lines.len(), 1);
+        let content: String = block.lines[0]
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(content.contains("✓"));
+        assert!(content.contains("write"));
+        assert!(content.contains("Created file.txt"));
+    }
+
+    #[test]
+    fn test_render_tool_result_with_diff() {
+        let result = ToolResult {
+            success: true,
+            result: Some("done".into()),
+            images: vec![],
+            ui_summary: Some("Modified src/main.rs (2 lines)".into()),
+            ui_details: None,
+            ui_details_full: None,
+            file_changes: Some(FileChanges {
+                path: "src/main.rs".into(),
+                lines_added: 2,
+                lines_removed: 1,
+                diff: Some(
+                    "@@ -1,3 +1,4 @@\n fn main() {\n-    old\n+    new\n+    extra\n }\n".into(),
+                ),
+            }),
+        };
+        let block = render_tool_result("x", "edit", &result, &test_styles());
+        // Should have summary line + blank + header + 4 diff lines + footer = 8
+        assert!(
+            block.lines.len() >= 6,
+            "expected diff lines, got {}",
+            block.lines.len()
+        );
+        // First line is summary
+        let summary: String = block.lines[0]
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(summary.contains("✓"), "should have checkmark");
+        // Should contain the diff content
+        let all: String = block
+            .lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(all.contains("src/main.rs"), "should contain file path");
+        assert!(all.contains("+2/-1"), "should contain line stats");
+        assert!(all.contains("+    new"), "should contain added line");
+        assert!(all.contains("-    old"), "should contain removed line");
+        assert!(all.contains("┌─"), "should have header border");
+        assert!(all.contains("└─"), "should have footer border");
+    }
+}

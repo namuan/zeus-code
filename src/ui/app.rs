@@ -43,6 +43,9 @@ pub struct App {
     pub autocomplete: AutocompleteState,
     /// Cached list of all project files (populated on first `@`).
     all_files: Vec<String>,
+
+    /// Tool call ID → tool name, used to render a preview when ToolEnd fires.
+    pending_tools: std::collections::HashMap<String, String>,
     pub should_quit: bool,
     pub agent_running: bool,
     pub current_turn: u64,
@@ -95,6 +98,7 @@ impl App {
             input: InputBox::new(),
             autocomplete: AutocompleteState::inactive(),
             all_files: Vec::new(),
+            pending_tools: std::collections::HashMap::new(),
             should_quit: false,
             agent_running: false,
             current_turn: 0,
@@ -483,6 +487,8 @@ impl App {
                     self.streaming_mark = self.chat.line_count();
                     self.chat
                         .add_line(format!("  🤖 Assistant (turn {turn})"), &self.styles);
+                    // Show a placeholder so the user knows the assistant is working
+                    self.chat.add_styled_line("  …", self.styles.dim_text());
                 }
                 AgentEvent::ThinkingDelta { text: thinking, .. } => {
                     self.streaming_thinking.push_str(&thinking);
@@ -492,8 +498,21 @@ impl App {
                     self.streaming_buffer.push_str(&text);
                     self.redraw_streaming();
                 }
-                AgentEvent::ToolStart { name, .. } => {
+                AgentEvent::ToolStart { name, id, .. } => {
                     self.chat.add_line(format!("  🔧 {name}"), &self.styles);
+                    // Track this tool for preview rendering
+                    self.pending_tools.insert(id, name);
+                }
+                AgentEvent::ToolArgsDelta { .. } => {
+                    // Args accumulate in ToolEnd; we render from the full JSON there
+                }
+                AgentEvent::ToolEnd { id, arguments, .. } => {
+                    if let Some(name) = self.pending_tools.remove(&id)
+                        && let Some(preview) = format_tool_preview(&name, &arguments)
+                    {
+                        self.chat
+                            .add_styled_line(&preview, self.styles.thinking_text());
+                    }
                 }
                 AgentEvent::ToolResult { result, .. } => {
                     let block = render_tool_result("", "tool", &result, &self.styles);
@@ -575,6 +594,53 @@ fn extract_user_text(content: &[crate::core::types::ContentBlock]) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Build a one-line preview of what a tool is about to do.
+fn format_tool_preview(name: &str, args_json: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(args_json).ok()?;
+    match name {
+        "edit" => {
+            let file = v.get("file_path")?.as_str()?;
+            let old = v.get("old_string")?.as_str()?;
+            let new = v.get("new_string")?.as_str()?;
+            let old_short: String = old.chars().take(60).collect();
+            let new_short: String = new.chars().take(60).collect();
+            let old_dots = if old.len() > 60 { "…" } else { "" };
+            let new_dots = if new.len() > 60 { "…" } else { "" };
+            Some(format!(
+                "     {}  {old_short}{old_dots} → {new_short}{new_dots}",
+                shorten_path_for_display(file),
+            ))
+        }
+        "write" => {
+            let file = v.get("file_path")?.as_str()?;
+            let content = v.get("content")?.as_str()?;
+            let preview: String = content.chars().take(80).collect();
+            let dots = if content.len() > 80 { "…" } else { "" };
+            Some(format!(
+                "     {}  {preview}{dots}",
+                shorten_path_for_display(file),
+            ))
+        }
+        "bash" => {
+            let cmd = v.get("command")?.as_str()?;
+            Some(format!("     $ {cmd}"))
+        }
+        "read" => {
+            let file = v.get("file_path")?.as_str()?;
+            Some(format!("     {}", shorten_path_for_display(file)))
+        }
+        _ => None,
+    }
+}
+
+fn shorten_path_for_display(path: &str) -> String {
+    if path.len() > 50 {
+        format!("…{}", &path[path.len().saturating_sub(49)..])
+    } else {
+        path.to_string()
+    }
 }
 
 // ── Tests ────────────────────────────────────────────────────────────
@@ -832,5 +898,107 @@ mod tests {
             app.chat.line_count() > 0,
             "chat should display session history after restore"
         );
+    }
+
+    // ── Tool preview ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_format_tool_preview_edit() {
+        let args = r#"{"file_path":"src/main.rs","old_string":"hello","new_string":"hello world"}"#;
+        let preview = format_tool_preview("edit", args);
+        assert!(preview.is_some());
+        let p = preview.unwrap();
+        assert!(p.contains("src/main.rs"), "should contain file path");
+        assert!(p.contains("hello"), "should contain old_string");
+        assert!(p.contains("hello world"), "should contain new_string");
+        assert!(p.contains("→"), "should contain arrow");
+    }
+
+    #[test]
+    fn test_format_tool_preview_write() {
+        let args =
+            r#"{"file_path":"src/lib.rs","content":"fn main() {\n    println!(\"hi\");\n}"}"#;
+        let preview = format_tool_preview("write", args);
+        assert!(preview.is_some());
+        let p = preview.unwrap();
+        assert!(p.contains("src/lib.rs"), "should contain file path");
+        assert!(p.contains("fn main()"), "should contain content preview");
+    }
+
+    #[test]
+    fn test_format_tool_preview_bash() {
+        let args = r#"{"command":"cargo build --release"}"#;
+        let preview = format_tool_preview("bash", args);
+        assert!(preview.is_some());
+        let p = preview.unwrap();
+        assert!(p.contains("cargo build"), "should contain command");
+    }
+
+    #[test]
+    fn test_format_tool_preview_read() {
+        let args = r#"{"file_path":"src/main.rs"}"#;
+        let preview = format_tool_preview("read", args);
+        assert!(preview.is_some());
+        let p = preview.unwrap();
+        assert!(p.contains("src/main.rs"), "should contain file path");
+    }
+
+    #[test]
+    fn test_format_tool_preview_unknown_tool() {
+        let args = r#"{"foo":"bar"}"#;
+        let preview = format_tool_preview("grep", args);
+        assert!(preview.is_none(), "unknown tools should return None");
+    }
+
+    // ── Thinking delta streaming ──────────────────────────────────────
+
+    #[test]
+    fn test_thinking_delta_accumulates() {
+        let mut app = make_test_app();
+        // Simulate a TurnStart
+        app.streaming_mark = 0;
+        app.streaming_thinking.clear();
+
+        // Process a ThinkingDelta
+        app.process_event_for_test(AgentEvent::ThinkingDelta {
+            text: "Let me think...".into(),
+        });
+
+        assert_eq!(app.streaming_thinking, "Let me think...");
+    }
+
+    #[test]
+    fn test_thinking_delta_cleared_on_turn_start() {
+        let mut app = make_test_app();
+        app.streaming_thinking = "old thinking".into();
+
+        // TurnStart should clear thinking
+        app.process_event_for_test(AgentEvent::TurnStart { turn: 1 });
+
+        assert!(app.streaming_thinking.is_empty());
+    }
+}
+
+/// Test-only helper to process a single event.
+#[cfg(test)]
+impl App {
+    fn process_event_for_test(&mut self, event: AgentEvent) {
+        // Manually dispatch the event by feeding it into the event channel
+        // and calling process_events. A simpler approach: manually match.
+        match event {
+            AgentEvent::TurnStart { turn } => {
+                self.current_turn = turn;
+                self.streaming_buffer.clear();
+                self.streaming_thinking.clear();
+                self.streaming_mark = self.chat.line_count();
+                self.chat
+                    .add_line(format!("  🤖 Assistant (turn {turn})"), &self.styles);
+            }
+            AgentEvent::ThinkingDelta { text, .. } => {
+                self.streaming_thinking.push_str(&text);
+                self.redraw_streaming();
+            }
+            _ => {}
+        }
     }
 }
