@@ -88,10 +88,10 @@ async fn run_headless_inner(cli: Cli, prompt_arg: Option<String>) -> KonResult<i
 
     // Create an ephemeral session (no persistence in headless mode)
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let session = Session::new(cwd, system_prompt, extra_tools).await?;
+    let mut session = Session::new(cwd, system_prompt, extra_tools).await?;
 
     // Create and run agent
-    let mut agent = Agent::new(config, provider, session);
+    let agent = Agent::new(config, provider);
 
     let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(32);
     let (_cancel_tx, cancel_rx) = watch::channel(false);
@@ -103,7 +103,11 @@ async fn run_headless_inner(cli: Cli, prompt_arg: Option<String>) -> KonResult<i
     );
 
     // Run agent in background
-    let handle = tokio::spawn(async move { agent.run(prompt, None, event_tx, cancel_rx).await });
+    let handle = tokio::spawn(async move {
+        agent
+            .run(&mut session, prompt, None, event_tx, cancel_rx)
+            .await
+    });
 
     // Collect output, print to stdout
     let mut final_text = String::new();

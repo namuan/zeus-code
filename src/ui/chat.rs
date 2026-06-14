@@ -3,7 +3,7 @@
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Paragraph;
+use ratatui::widgets::{Paragraph, Wrap};
 
 use crate::ui::blocks::MessageBlock;
 use crate::ui::styles::Styles;
@@ -12,7 +12,8 @@ use crate::ui::styles::Styles;
 pub struct ChatLog {
     /// All rendered lines in display order.
     lines: Vec<Line<'static>>,
-    /// Vertical scroll offset.
+    /// How many rows the user has scrolled UP from the bottom.
+    /// 0 = bottom (most recent), N = N rows above bottom.
     scroll: u16,
 }
 
@@ -67,54 +68,82 @@ impl ChatLog {
         self.lines.len()
     }
 
+    /// Scroll up by N visual rows (move away from bottom).
     pub fn scroll_up(&mut self, amount: u16) {
         self.scroll = self.scroll.saturating_add(amount);
     }
 
+    /// Scroll down by N visual rows (move toward bottom).
     pub fn scroll_down(&mut self, amount: u16) {
         self.scroll = self.scroll.saturating_sub(amount);
     }
 
+    /// Jump to the bottom.
     pub fn scroll_to_bottom(&mut self) {
         self.scroll = 0;
     }
 
     pub fn render(&self, f: &mut Frame, area: Rect, styles: &Styles) {
-        use ratatui::widgets::Wrap;
-
         if self.lines.is_empty() || area.height == 0 || area.width == 0 {
             return;
         }
 
-        // Estimate total visual rows after wrapping.
-        let total_visual = estimate_visual_rows(&self.lines, area.width);
-        // To show the bottom, scroll past the overflow.
-        // scroll counts rows UP from bottom (0 = bottom, N = N rows up).
-        let bottom_offset = total_visual.saturating_sub(area.height);
-        let offset = bottom_offset.saturating_sub(self.scroll);
+        let total = self.lines.len();
+        let scroll = (self.scroll as usize).min(total.saturating_sub(1));
 
-        let p = Paragraph::new(self.lines.clone())
+        // Take a generous window from the bottom so wrapping overflow is covered.
+        let window = (area.height as usize * 3).min(total).max(1);
+        let end = total.saturating_sub(scroll);
+        let start = end.saturating_sub(window);
+        // Ensure we always have at least one line
+        if start >= end {
+            return;
+        }
+
+        let slice: Vec<Line<'static>> = self.lines[start..end].to_vec();
+
+        // Build Paragraph once and query exact wrapped line count of the slice.
+        let p = Paragraph::new(slice)
             .style(styles.base())
-            .wrap(Wrap { trim: false })
-            .scroll((offset, 0u16));
+            .wrap(Wrap { trim: false });
+        let slice_visual = p.line_count(area.width) as u16;
+
+        // Scroll the slice to show its bottom portion in the viewport.
+        // If the slice is short (e.g. first messages), show from top.
+        let offset = slice_visual.saturating_sub(area.height);
+
+        let p = p.scroll((offset, 0u16));
         f.render_widget(p, area);
     }
-}
-
-/// Estimate how many visual rows `lines` will occupy when wrapped to `area_width`.
-fn estimate_visual_rows(lines: &[Line], area_width: u16) -> u16 {
-    let aw = area_width.max(1) as usize;
-    lines
-        .iter()
-        .map(|line| {
-            let w = line.width().max(1);
-            (w.div_ceil(aw)) as u16
-        })
-        .sum()
 }
 
 impl Default for ChatLog {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ratatui::text::Line;
+
+    #[test]
+    fn test_line_count_reasonable() {
+        use ratatui::widgets::{Paragraph, Wrap};
+        // Simulate a chat with 20 lines of ~60 chars each
+        let lines: Vec<Line> = (0..20)
+            .map(|i| {
+                Line::from(format!(
+                    "  This is chat line number {i} with some extra text to make it longer"
+                ))
+            })
+            .collect();
+        let p = Paragraph::new(lines).wrap(Wrap { trim: false });
+        let count = p.line_count(80);
+        // Each line is ~65 chars. At width 80, each is 1 row → 20 rows
+        // (or maybe more if wrapping happens at different boundaries)
+        println!("line_count at width 80: {count}");
+        assert!(count >= 20, "line_count ({count}) should be at least 20");
+        assert!(count <= 80, "line_count ({count}) should be reasonable");
     }
 }

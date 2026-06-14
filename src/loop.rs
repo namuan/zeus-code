@@ -11,7 +11,7 @@ use tokio::sync::{mpsc, watch};
 
 use crate::config::Config;
 use crate::core::compaction::{CompactionConfig, should_compact};
-use crate::core::errors::{KonError, KonResult};
+use crate::core::errors::KonResult;
 use crate::core::types::{AgentEvent, StopReason, Usage, UserMessage};
 use crate::llm::base::Provider;
 use crate::permissions::PermissionMode;
@@ -25,7 +25,6 @@ pub struct Agent {
     config: Arc<RwLock<Config>>,
     provider: Box<dyn Provider>,
     tools: Vec<Box<dyn Tool>>,
-    session: Session,
     max_turns: u64,
     context_window: u64,
     compaction_config: CompactionConfig,
@@ -41,7 +40,7 @@ pub struct AgentEndInfo {
 }
 
 impl Agent {
-    pub fn new(config: Arc<RwLock<Config>>, provider: Box<dyn Provider>, session: Session) -> Self {
+    pub fn new(config: Arc<RwLock<Config>>, provider: Box<dyn Provider>) -> Self {
         let cfg = config.read();
         let tools = tools_mod::core_tools();
 
@@ -49,7 +48,6 @@ impl Agent {
             config: config.clone(),
             provider,
             tools,
-            session,
             max_turns: cfg.agent.max_turns,
             context_window: cfg.agent.default_context_window,
             compaction_config: cfg.compaction.clone(),
@@ -61,8 +59,10 @@ impl Agent {
     }
 
     /// Run the agent on a user query, emitting events to the channel.
+    /// The session is mutated in-place (messages appended) but remains owned by the caller.
     pub async fn run(
-        &mut self,
+        &self,
+        session: &mut Session,
         query: String,
         skill_name: Option<String>,
         event_tx: mpsc::Sender<AgentEvent>,
@@ -75,7 +75,7 @@ impl Agent {
             content: vec![crate::core::types::ContentBlock::Text { text: query }],
             skill_name,
         };
-        self.session.append_user_message(user_msg).await?;
+        session.append_user_message(user_msg).await?;
 
         // Build system prompt once
         let system_prompt = build_system_prompt(&self.config, &self.tools);
@@ -90,7 +90,7 @@ impl Agent {
         loop {
             // Check for cancellation before each turn
             if *cancel_rx.borrow() {
-                return Err(KonError::Cancelled);
+                return Err(crate::core::errors::KonError::Cancelled);
             }
 
             // Check max turns
@@ -105,7 +105,7 @@ impl Agent {
                 .await;
 
             // Get messages from session
-            let messages = self.session.active_messages();
+            let messages = session.active_messages();
 
             // Run one turn
             let turn_runner = TurnRunner::new(
@@ -121,7 +121,7 @@ impl Agent {
 
             // Append assistant message to session
             let assistant_content = turn_result.assistant_content.clone();
-            self.session
+            session
                 .append_assistant_message(
                     assistant_content,
                     Some(turn_result.usage.clone()),
@@ -138,7 +138,7 @@ impl Agent {
                     images: tr.images.clone(),
                     file_changes: tr.file_changes.clone(),
                 };
-                self.session.append_tool_result(msg).await?;
+                session.append_tool_result(msg).await?;
             }
 
             // Accumulate usage
@@ -163,7 +163,7 @@ impl Agent {
                 .await;
 
             // Check compaction
-            let messages = self.session.active_messages();
+            let messages = session.active_messages();
             if should_compact(
                 &messages,
                 &system_prompt,
@@ -256,27 +256,31 @@ fn build_system_prompt(config: &Arc<RwLock<Config>>, tools: &[Box<dyn Tool>]) ->
 mod tests {
     use super::*;
     use crate::config::Config;
+    use crate::core::errors::KonError;
     use crate::llm::providers::mock::MockProvider;
     use crate::tools as tools_mod;
     use std::path::PathBuf;
 
-    async fn test_agent() -> Agent {
+    async fn test_agent() -> (Agent, Session) {
         let config = Arc::new(RwLock::new(Config::load_defaults()));
         let provider = Box::new(MockProvider::new("mock".into()));
         let cwd = PathBuf::from("/tmp/test");
         let session = Session::new(cwd, "test sp".into(), vec![]).await.unwrap();
 
-        Agent::new(config, provider, session)
+        (Agent::new(config, provider), session)
     }
 
     #[tokio::test]
     async fn test_agent_simple_run() {
-        let mut agent = test_agent().await;
+        let (agent, mut session) = test_agent().await;
         let (event_tx, mut event_rx) = mpsc::channel(32);
         let (_cancel_tx, cancel_rx) = watch::channel(false);
 
-        let handle =
-            tokio::spawn(async move { agent.run("hello".into(), None, event_tx, cancel_rx).await });
+        let handle = tokio::spawn(async move {
+            agent
+                .run(&mut session, "hello".into(), None, event_tx, cancel_rx)
+                .await
+        });
 
         // Collect events
         let mut events = Vec::new();
@@ -309,15 +313,21 @@ mod tests {
         let config = Arc::new(RwLock::new(config));
         let provider = Box::new(MockProvider::new("mock:tool".into()));
         let cwd = PathBuf::from("/tmp/test");
-        let session = Session::new(cwd, "sp".into(), vec![]).await.unwrap();
-        let mut agent = Agent::new(config, provider, session);
+        let mut session = Session::new(cwd, "sp".into(), vec![]).await.unwrap();
+        let agent = Agent::new(config, provider);
 
         let (event_tx, mut event_rx) = mpsc::channel(64);
         let (_cancel_tx, cancel_rx) = watch::channel(false);
 
         let handle = tokio::spawn(async move {
             agent
-                .run("do something".into(), None, event_tx, cancel_rx)
+                .run(
+                    &mut session,
+                    "do something".into(),
+                    None,
+                    event_tx,
+                    cancel_rx,
+                )
                 .await
         });
 
@@ -353,14 +363,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_agent_cancellation() {
-        let mut agent = test_agent().await;
+        let (agent, mut session) = test_agent().await;
         let (event_tx, _event_rx) = mpsc::channel(32);
         let (cancel_tx, cancel_rx) = watch::channel(false);
 
         // Cancel before starting
         cancel_tx.send(true).unwrap();
 
-        let result = agent.run("hello".into(), None, event_tx, cancel_rx).await;
+        let result = agent
+            .run(&mut session, "hello".into(), None, event_tx, cancel_rx)
+            .await;
 
         assert!(matches!(result, Err(KonError::Cancelled)));
     }

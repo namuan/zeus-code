@@ -148,7 +148,7 @@ impl Session {
     pub async fn new(cwd: PathBuf, system_prompt: String, tools: Vec<String>) -> KonResult<Self> {
         let id = Uuid::new_v4();
         let timestamp = now_iso();
-        let file_path = session_path(&cwd, &id, &timestamp)?;
+        let file_path = session_path(&id)?;
 
         let header = SessionEntry::Header {
             version: 1,
@@ -411,7 +411,7 @@ impl Session {
     pub fn new_sync(cwd: PathBuf, system_prompt: String, tools: Vec<String>) -> KonResult<Self> {
         let id = Uuid::new_v4();
         let timestamp = now_iso();
-        let file_path = session_path(&cwd, &id, &timestamp)?;
+        let file_path = session_path(&id)?;
 
         let header = SessionEntry::Header {
             version: 1,
@@ -555,27 +555,16 @@ impl ConversationTree {
 
 // ── Session paths ────────────────────────────────────────────────────────
 
-/// Compute the session directory for a working directory.
+/// Compute the base session directory (~/.zeus-code/sessions).
 fn sessions_dir() -> PathBuf {
-    let base = dirs::config_dir().unwrap_or_else(|| PathBuf::from("~/.config"));
-    base.join("zeus").join("sessions")
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("~"));
+    home.join(".zeus-code").join("sessions")
 }
 
-/// Sanitize a path for use in a directory name.
-fn sanitize_for_path(path: &Path) -> String {
-    let display = path.display().to_string();
-    display
-        .replace(['/', '\\', ':'], "_")
-        .trim_start_matches('_')
-        .to_string()
-}
+/// Compute the full path for a session file: ~/.zeus-code/sessions/{id}.jsonl
+fn session_path(id: &Uuid) -> KonResult<PathBuf> {
+    let dir = sessions_dir();
 
-/// Compute the full path for a session file.
-fn session_path(cwd: &Path, id: &Uuid, timestamp: &str) -> KonResult<PathBuf> {
-    let sanitized = sanitize_for_path(cwd);
-    let dir = sessions_dir().join(&sanitized);
-
-    // Create the directory if needed
     std::fs::create_dir_all(&dir).map_err(|e| {
         KonError::Session(format!(
             "failed to create session directory {}: {e}",
@@ -583,9 +572,7 @@ fn session_path(cwd: &Path, id: &Uuid, timestamp: &str) -> KonResult<PathBuf> {
         ))
     })?;
 
-    // Format timestamp for filename (replace colons)
-    let ts_clean = timestamp.replace(':', "-");
-    Ok(dir.join(format!("{ts_clean}_{id}.jsonl")))
+    Ok(dir.join(format!("{id}.jsonl")))
 }
 
 /// Find all session JSONL files.
@@ -598,15 +585,9 @@ fn find_session_files() -> Vec<PathBuf> {
     let mut files = Vec::new();
     if let Ok(entries) = std::fs::read_dir(&base) {
         for entry in entries.flatten() {
-            if entry.path().is_dir()
-                && let Ok(sub_entries) = std::fs::read_dir(entry.path())
-            {
-                for sub in sub_entries.flatten() {
-                    let path = sub.path();
-                    if path.extension().is_some_and(|e| e == "jsonl") {
-                        files.push(path);
-                    }
-                }
+            let path = entry.path();
+            if path.is_file() && path.extension().is_some_and(|e| e == "jsonl") {
+                files.push(path);
             }
         }
     }
@@ -766,18 +747,6 @@ mod tests {
         let messages = session.active_messages();
         assert_eq!(messages.len(), 1);
         assert!(matches!(messages[0], Message::User(_)));
-    }
-
-    #[test]
-    fn test_sanitize_for_path() {
-        assert_eq!(
-            sanitize_for_path(Path::new("/home/user/project")),
-            "home_user_project"
-        );
-        assert_eq!(
-            sanitize_for_path(Path::new("C:\\Users\\test")),
-            "C__Users_test"
-        );
     }
 
     #[test]

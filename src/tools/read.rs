@@ -12,6 +12,9 @@ use crate::core::types::ToolResult;
 use crate::tools::base::Tool;
 use crate::tools::utils::{format_with_line_numbers, shorten_path};
 
+/// Default read limit when the model doesn't specify one (controls context bloat).
+const DEFAULT_READ_LIMIT: usize = 500;
+
 pub struct ReadTool;
 
 impl ReadTool {
@@ -34,8 +37,8 @@ impl Tool for ReadTool {
 
     fn description(&self) -> &str {
         "Read a file from the local filesystem. Supports text files (returns content \
-         with line numbers), image files (returns base64), and directory listing. \
-         Use the offset and limit parameters for pagination on large files."
+         with line numbers, up to 500 lines by default — use offset/limit to paginate), \
+         image files (returns base64), and directory listing."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -132,24 +135,33 @@ impl ReadTool {
             })?;
 
         let offset = params["offset"].as_u64().unwrap_or(1).max(1) as usize;
-        let limit = params["limit"].as_u64().map(|l| l as usize);
+        // Enforce a limit to prevent context-window bloat. If the model didn't
+        // specify one, apply the default so a single read can't flood context.
+        let limit = params["limit"]
+            .as_u64()
+            .map(|l| (l as usize).min(DEFAULT_READ_LIMIT))
+            .unwrap_or(DEFAULT_READ_LIMIT);
 
         let lines: Vec<&str> = content.lines().collect();
         let total_lines = lines.len();
 
         // Apply offset (1-indexed → 0-indexed)
         let start = (offset - 1).min(total_lines);
-        let end = limit
-            .map(|l| (start + l).min(total_lines))
-            .unwrap_or(total_lines);
+        let end = (start + limit).min(total_lines);
 
         let selected: Vec<&str> = lines[start..end].to_vec();
         let formatted = format_with_line_numbers(&selected.join("\n"), offset);
 
         let summary = if total_lines == 0 {
             "Empty file".into()
-        } else if limit.is_some() {
+        } else if params["limit"].as_u64().is_some() {
             format!("Lines {}-{} of {}", offset, end, total_lines)
+        } else if total_lines > DEFAULT_READ_LIMIT {
+            format!(
+                "First {} of {} lines (use offset/limit for more)",
+                end.saturating_sub(offset).max(0),
+                total_lines
+            )
         } else {
             format!("Read {} lines", total_lines)
         };

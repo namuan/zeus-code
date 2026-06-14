@@ -48,6 +48,10 @@ pub struct App {
     /// Used to trim streaming text and replace with formatted blocks on TurnEnd.
     streaming_mark: usize,
 
+    /// The current conversation session (persisted across turns).
+    /// Wrapped for safe sharing between the TUI thread and agent tasks.
+    session: Arc<parking_lot::Mutex<Option<Session>>>,
+
     // Channels
     event_tx: mpsc::Sender<AgentEvent>,
     event_rx: mpsc::Receiver<AgentEvent>,
@@ -82,6 +86,7 @@ impl App {
             current_turn: 0,
             total_tokens: 0,
             streaming_mark: 0,
+            session: Arc::new(parking_lot::Mutex::new(None)),
             event_tx,
             event_rx,
             cancel_tx,
@@ -211,11 +216,27 @@ impl App {
         let event_tx = self.event_tx.clone();
         let cancel_rx = self.cancel_rx.clone();
 
-        // Clone what the agent task needs
-        let mut agent = self.build_agent();
+        // Take the existing session out (or create a new one) for the agent
+        let mut session_guard = self.session.lock();
+        let mut session = session_guard.take().unwrap_or_else(|| {
+            let sp = self.config.read().llm.system_prompt.content.clone();
+            let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            Session::new_sync(cwd, sp, vec![]).expect("failed to create session")
+        });
+        drop(session_guard);
+
+        let agent = self.build_agent();
+        let session_arc = Arc::clone(&self.session);
 
         // Spawn agent
-        let handle = tokio::spawn(async move { agent.run(query, None, event_tx, cancel_rx).await });
+        let handle = tokio::spawn(async move {
+            let result = agent
+                .run(&mut session, query, None, event_tx, cancel_rx)
+                .await;
+            // Put the session back (with all messages appended) for the next turn
+            *session_arc.lock() = Some(session);
+            result
+        });
         self.agent_handle = Some(handle);
     }
 
@@ -231,14 +252,9 @@ impl App {
         }
         let provider = create_provider(&pc)
             .unwrap_or_else(|_| create_provider(&ProviderConfig::new("mock", "mock", "")).unwrap());
-        let sp = cfg.llm.system_prompt.content.clone();
-        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         drop(cfg);
 
-        let session = Session::new_sync(cwd, sp, vec![])
-            .unwrap_or_else(|e| panic!("failed to create session: {e}"));
-
-        Agent::new(self.config.clone(), provider, session)
+        Agent::new(self.config.clone(), provider)
     }
 
     /// Process agent events from the channel.

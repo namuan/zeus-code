@@ -18,15 +18,18 @@ async fn test_full_agent_run_text_response() {
     let config = Arc::new(RwLock::new(Config::load_defaults()));
     let provider = create_provider(&ProviderConfig::new("mock", "mock", "")).unwrap();
     let cwd = PathBuf::from("/tmp/test-integration");
-    let session = Session::new(cwd, "test sp".into(), vec![]).await.unwrap();
+    let mut session = Session::new(cwd, "test sp".into(), vec![]).await.unwrap();
 
-    let mut agent = Agent::new(config, provider, session);
+    let agent = Agent::new(config, provider);
 
     let (event_tx, mut event_rx) = mpsc::channel(128);
     let (_cancel_tx, cancel_rx) = watch::channel(false);
 
-    let handle =
-        tokio::spawn(async move { agent.run("hello".into(), None, event_tx, cancel_rx).await });
+    let handle = tokio::spawn(async move {
+        agent
+            .run(&mut session, "hello".into(), None, event_tx, cancel_rx)
+            .await
+    });
 
     let mut got_start = false;
     let mut got_turn = false;
@@ -65,15 +68,18 @@ async fn test_agent_respects_max_turns() {
     // Use mock:tool which returns ToolUse → agent would loop if max_turns not enforced
     let provider = create_provider(&ProviderConfig::new("mock", "mock:tool", "")).unwrap();
     let cwd = PathBuf::from("/tmp/test-max-turns");
-    let session = Session::new(cwd, "sp".into(), vec![]).await.unwrap();
+    let mut session = Session::new(cwd, "sp".into(), vec![]).await.unwrap();
 
-    let mut agent = Agent::new(config, provider, session);
+    let agent = Agent::new(config, provider);
 
     let (event_tx, mut event_rx) = mpsc::channel(128);
     let (_cancel_tx, cancel_rx) = watch::channel(false);
 
-    let handle =
-        tokio::spawn(async move { agent.run("test".into(), None, event_tx, cancel_rx).await });
+    let handle = tokio::spawn(async move {
+        agent
+            .run(&mut session, "test".into(), None, event_tx, cancel_rx)
+            .await
+    });
 
     let mut end_reason = None;
     let mut total_turns = 0;
