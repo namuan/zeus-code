@@ -13,7 +13,8 @@ use crate::ui::styles::Styles;
 /// Convert markdown text to a list of styled ratatui Lines.
 pub fn render_markdown(text: &str, indent: &str, styles: &Styles) -> Vec<Line<'static>> {
     let arena = Arena::new();
-    let options = ComrakOptions::default();
+    let mut options = ComrakOptions::default();
+    options.extension.table = true;
     let root = comrak::parse_document(&arena, text, &options);
 
     let mut lines: Vec<Line<'static>> = Vec::new();
@@ -128,15 +129,12 @@ fn flatten_ast<'a>(
                 )));
             }
 
-            // Table support: render as plain dim text
-            NodeValue::Table(_) | NodeValue::TableRow(_) | NodeValue::TableCell => {
-                let text = collect_text(child);
-                if !text.trim().is_empty() {
-                    out.push(Line::from(Span::styled(
-                        format!("{indent}{text}"),
-                        styles.dim_text(),
-                    )));
-                }
+            // Table support: render with | column separators
+            NodeValue::Table(_) => {
+                render_table(child, indent, styles, out);
+            }
+            NodeValue::TableRow(_) | NodeValue::TableCell => {
+                // Handled by render_table; ignore at this level
             }
 
             _ => {
@@ -147,21 +145,157 @@ fn flatten_ast<'a>(
     }
 }
 
-/// Collect all text content from an AST node and its descendants.
-fn collect_text<'a>(node: &'a AstNode<'a>) -> String {
-    let mut buf = String::new();
-    collect_text_inner(node, &mut buf);
-    buf
+// ── Table rendering ──────────────────────────────────────────────────
+
+/// Render a GFM table as ratatui Lines with | column separators.
+fn render_table<'a>(
+    node: &'a AstNode<'a>,
+    indent: &str,
+    styles: &Styles,
+    out: &mut Vec<Line<'static>>,
+) {
+    // Collect rows: each row is Vec<cell_text>
+    let mut rows: Vec<Vec<String>> = Vec::new();
+
+    for child in node.children() {
+        if !matches!(&child.data.borrow().value, NodeValue::TableRow(_)) {
+            continue;
+        }
+        let mut cells: Vec<String> = Vec::new();
+        for cell_node in child.children() {
+            let text = collect_inline_text(cell_node);
+            cells.push(text);
+        }
+        if !cells.is_empty() {
+            rows.push(cells);
+        }
+    }
+
+    if rows.is_empty() {
+        return;
+    }
+
+    // Determine column count and widths
+    let ncols = rows.iter().map(|r| r.len()).max().unwrap_or(1);
+    let mut widths: Vec<usize> = vec![0; ncols];
+    for row in &rows {
+        for (i, cell) in row.iter().enumerate() {
+            if i < ncols {
+                widths[i] = widths[i].max(cell.len());
+            }
+        }
+    }
+
+    // Padding
+    let cell_pad = 1; // one space on each side of cell content
+
+    // Render header row (first row)
+    let header_style = styles.accent_text();
+
+    // Top border
+    render_table_border(
+        indent,
+        &widths,
+        cell_pad,
+        ("┌", "┬", "┐"),
+        header_style,
+        out,
+    );
+
+    // Header cells
+    if let Some(header) = rows.first() {
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        spans.push(Span::styled(format!("{indent}│"), header_style));
+        for (i, cell) in header.iter().enumerate() {
+            let w = widths.get(i).copied().unwrap_or(0);
+            spans.push(Span::styled(
+                format!(" {: <w$} ", cell, w = w),
+                header_style,
+            ));
+            spans.push(Span::styled("│", header_style));
+        }
+        out.push(Line::from(spans));
+    }
+
+    // Separator after header
+    render_table_border(
+        indent,
+        &widths,
+        cell_pad,
+        ("├", "┼", "┤"),
+        header_style,
+        out,
+    );
+
+    // Body rows
+    let body_style = styles.dim_text();
+    for row in rows.iter().skip(1) {
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        spans.push(Span::styled(format!("{indent}│"), body_style));
+        for (i, cell) in row.iter().enumerate() {
+            let w = widths.get(i).copied().unwrap_or(0);
+            spans.push(Span::styled(format!(" {: <w$} ", cell, w = w), body_style));
+            spans.push(Span::styled("│", body_style));
+        }
+        // Pad missing cells
+        for _ in row.len()..ncols {
+            let w = widths.get(row.len()).copied().unwrap_or(0);
+            spans.push(Span::styled(format!(" {: <w$} ", "", w = w), body_style));
+            spans.push(Span::styled("│", body_style));
+        }
+        out.push(Line::from(spans));
+    }
+
+    // Bottom border
+    render_table_border(
+        indent,
+        &widths,
+        cell_pad,
+        ("└", "┴", "┘"),
+        header_style,
+        out,
+    );
 }
 
-fn collect_text_inner<'a>(node: &'a AstNode<'a>, buf: &mut String) {
+/// Draw a horizontal table border line.
+fn render_table_border(
+    indent: &str,
+    widths: &[usize],
+    pad: usize,
+    (left, mid, right): (&str, &str, &str),
+    style: ratatui::style::Style,
+    out: &mut Vec<Line<'static>>,
+) {
+    let mut line = String::from(indent);
+    line.push_str(left);
+    for (i, w) in widths.iter().enumerate() {
+        line.push_str(&"─".repeat(w + pad * 2));
+        if i + 1 < widths.len() {
+            line.push_str(mid);
+        } else {
+            line.push_str(right);
+        }
+    }
+    out.push(Line::from(Span::styled(line, style)));
+}
+
+// ── Helpers ──────────────────────────────────────────────────────────
+
+/// Collect inline text from a node (used for table cells).
+fn collect_inline_text<'a>(node: &'a AstNode<'a>) -> String {
+    let mut spans: Vec<String> = Vec::new();
+    collect_inline_text_inner(node, &mut spans);
+    spans.join("")
+}
+
+fn collect_inline_text_inner<'a>(node: &'a AstNode<'a>, out: &mut Vec<String>) {
     for child in node.children() {
         match &child.data.borrow().value {
-            NodeValue::Text(t) => buf.push_str(t),
-            NodeValue::SoftBreak => buf.push(' '),
-            NodeValue::LineBreak => buf.push('\n'),
-            NodeValue::Code(c) => buf.push_str(&c.literal),
-            _ => collect_text_inner(child, buf),
+            NodeValue::Text(t) => out.push(t.clone()),
+            NodeValue::SoftBreak => out.push(" ".to_string()),
+            NodeValue::LineBreak => {}
+            NodeValue::Code(c) => out.push(c.literal.clone()),
+            _ => collect_inline_text_inner(child, out),
         }
     }
 }
@@ -271,5 +405,46 @@ mod tests {
             .iter()
             .any(|s| s.content.as_ref() == "std::io");
         assert!(has_code);
+    }
+
+    #[test]
+    fn test_table_basic() {
+        let md = "| Name | Value |\n| ---- | ----- |\n| foo  | 42    |\n| bar  | 99    |";
+        let lines = render_markdown(md, "  ", &test_styles());
+        let content: String = lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        // Should contain box-drawing border chars and cell content
+        assert!(content.contains("┌"), "missing top-left box char");
+        assert!(content.contains("Name"));
+        assert!(content.contains("Value"));
+        assert!(content.contains("foo"));
+        assert!(content.contains("42"));
+        assert!(content.contains("└"));
+    }
+
+    #[test]
+    fn test_table_single_cell() {
+        let md = "| only |\n| ---- |\n| one  |";
+        let lines = render_markdown(md, "", &test_styles());
+        let content: String = lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(content.contains("only"));
+        assert!(content.contains("one"));
     }
 }
