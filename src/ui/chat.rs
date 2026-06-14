@@ -82,19 +82,35 @@ impl ChatLog {
     pub fn render(&self, f: &mut Frame, area: Rect, styles: &Styles) {
         use ratatui::widgets::Wrap;
 
-        if self.lines.is_empty() || area.height == 0 {
+        if self.lines.is_empty() || area.height == 0 || area.width == 0 {
             return;
         }
 
-        // Pass all lines so the Paragraph can reflow with wrapping.
-        // Scroll offset is in visual rows (after wrapping), not logical lines.
-        let scroll_offset = self.scroll;
+        // Estimate total visual rows after wrapping.
+        let total_visual = estimate_visual_rows(&self.lines, area.width);
+        // To show the bottom, scroll past the overflow.
+        // scroll counts rows UP from bottom (0 = bottom, N = N rows up).
+        let bottom_offset = total_visual.saturating_sub(area.height);
+        let offset = bottom_offset.saturating_sub(self.scroll);
+
         let p = Paragraph::new(self.lines.clone())
             .style(styles.base())
             .wrap(Wrap { trim: false })
-            .scroll((scroll_offset, 0u16));
+            .scroll((offset, 0u16));
         f.render_widget(p, area);
     }
+}
+
+/// Estimate how many visual rows `lines` will occupy when wrapped to `area_width`.
+fn estimate_visual_rows(lines: &[Line], area_width: u16) -> u16 {
+    let aw = area_width.max(1) as usize;
+    lines
+        .iter()
+        .map(|line| {
+            let w = line.width().max(1);
+            (w.div_ceil(aw)) as u16
+        })
+        .sum()
 }
 
 impl Default for ChatLog {

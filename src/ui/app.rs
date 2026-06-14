@@ -166,6 +166,7 @@ impl App {
                 }
 
                 // Regular input → run agent
+                self.chat.scroll_to_bottom();
                 self.run_agent(&text);
             }
 
@@ -175,10 +176,18 @@ impl App {
             KeyCode::Left => self.input.cursor_left(),
             KeyCode::Right => self.input.cursor_right(),
             KeyCode::Home => self.input.cursor_home(),
+            // Ctrl+End: scroll chat to bottom
+            KeyCode::End if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.chat.scroll_to_bottom();
+            }
             KeyCode::End => self.input.cursor_end(),
             KeyCode::Up => self.input.history_prev(),
             KeyCode::Down => self.input.history_next(),
             KeyCode::Char(c) => self.input.insert_char(c),
+
+            // Chat scrolling (PageUp / PageDown scroll by screenful)
+            KeyCode::PageUp => self.chat.scroll_up(20),
+            KeyCode::PageDown => self.chat.scroll_down(20),
 
             _ => {}
         }
