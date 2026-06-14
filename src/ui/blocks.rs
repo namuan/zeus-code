@@ -6,6 +6,7 @@
 use ratatui::text::{Line, Span};
 
 use crate::core::types::{ContentBlock, ToolResult};
+use crate::ui::markdown;
 use crate::ui::styles::Styles;
 
 /// Rendered message block ready for display.
@@ -69,16 +70,11 @@ pub fn render_assistant_message(content: &[ContentBlock], styles: &Styles) -> Ve
     blocks
 }
 
-/// Render a text block from the assistant.
+/// Render a text block from the assistant (markdown-aware).
 fn render_text_block(text: &str, styles: &Styles) -> MessageBlock {
-    let mut lines = Vec::new();
-    for line in text.lines() {
-        lines.push(Line::from(Span::styled(format!("  {line}"), styles.base())));
-    }
-    MessageBlock {
-        height: lines.len() as u16,
-        lines,
-    }
+    let lines = markdown::render_markdown(text, "  ", styles);
+    let h = lines.len() as u16;
+    MessageBlock { lines, height: h }
 }
 
 /// Render a thinking block.

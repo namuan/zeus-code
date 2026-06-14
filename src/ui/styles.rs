@@ -99,4 +99,35 @@ impl Styles {
     pub fn border_style(&self) -> Style {
         Style::default().fg(self.border)
     }
+
+    // ── Markdown styles ──────────────────────────────────────────────
+
+    pub fn heading(&self) -> Style {
+        Style::default()
+            .fg(self.accent)
+            .bg(self.bg)
+            .add_modifier(Modifier::BOLD)
+    }
+
+    pub fn code_block(&self) -> Style {
+        Style::default().fg(self.fg).bg(self.surface)
+    }
+
+    pub fn inline_code(&self) -> Style {
+        Style::default().fg(self.accent).bg(self.surface)
+    }
+
+    pub fn link(&self) -> Style {
+        Style::default()
+            .fg(Color::Rgb(69, 133, 136))
+            .bg(self.bg)
+            .add_modifier(Modifier::UNDERLINED)
+    }
+
+    pub fn block_quote(&self) -> Style {
+        Style::default()
+            .fg(self.dim)
+            .bg(self.bg)
+            .add_modifier(Modifier::ITALIC)
+    }
 }

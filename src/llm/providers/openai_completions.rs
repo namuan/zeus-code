@@ -384,10 +384,18 @@ impl OpenAICompletionsProvider {
 
     /// Send the request and return a stream of bytes.
     async fn send_request(&self, request: &ChatRequest) -> KonResult<reqwest::Response> {
-        let url = format!(
-            "{}/v1/chat/completions",
-            self.base_url.trim_end_matches('/')
-        );
+        let base = self.base_url.trim_end_matches('/');
+        // If base URL already includes the /v1 prefix (e.g. http://localhost:8080/v1),
+        // don't append it again — go straight to the completions endpoint.
+        let url = if base.ends_with("/v1/chat/completions") || base.ends_with("/chat/completions") {
+            base.to_string()
+        } else if base.ends_with("/v1") {
+            format!("{base}/chat/completions")
+        } else {
+            format!("{base}/v1/chat/completions")
+        };
+
+        tracing::info!("POST {url} (model={})", self.config.model_id);
 
         let mut req = self
             .client

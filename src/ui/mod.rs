@@ -7,6 +7,7 @@ pub mod export;
 pub mod formatting;
 pub mod input;
 pub mod launch;
+pub mod markdown;
 pub mod styles;
 pub mod welcome;
 pub mod widgets;

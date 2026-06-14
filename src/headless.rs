@@ -60,11 +60,18 @@ async fn run_headless_inner(cli: Cli, prompt_arg: Option<String>) -> KonResult<i
     // Scope the read lock so it's dropped before awaits
     let (provider_config, system_prompt, extra_tools) = {
         let cfg = config.read();
-        let pc = ProviderConfig::new(
+        let mut pc = ProviderConfig::new(
             &cfg.llm.default_provider,
             &cfg.llm.default_model,
             &cli.api_key.unwrap_or_default(),
         );
+        // Override base URL from config (or CLI, already merged)
+        if !cfg.llm.default_base_url.is_empty() {
+            pc.base_url = Some(cfg.llm.default_base_url.clone());
+        }
+        if cfg.llm.tls.insecure_skip_verify {
+            pc.insecure_skip_verify = true;
+        }
         let sp = cfg.llm.system_prompt.content.clone();
         let tools = cfg.tools.extra.clone();
         (pc, sp, tools)

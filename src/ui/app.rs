@@ -17,7 +17,9 @@ use crate::llm::providers::{ProviderConfig, create_provider};
 use crate::r#loop::Agent;
 use crate::session::Session;
 use crate::tools::base::Tool;
-use crate::ui::blocks::{render_status, render_tool_result, render_user_message};
+use crate::ui::blocks::{
+    render_assistant_message, render_status, render_tool_result, render_user_message,
+};
 use crate::ui::chat::ChatLog;
 use crate::ui::commands::{Command, parse_command};
 use crate::ui::input::InputBox;
@@ -41,6 +43,10 @@ pub struct App {
     pub agent_running: bool,
     pub current_turn: u64,
     pub total_tokens: u64,
+
+    /// Line count in chat when the current streaming turn began.
+    /// Used to trim streaming text and replace with formatted blocks on TurnEnd.
+    streaming_mark: usize,
 
     // Channels
     event_tx: mpsc::Sender<AgentEvent>,
@@ -75,6 +81,7 @@ impl App {
             agent_running: false,
             current_turn: 0,
             total_tokens: 0,
+            streaming_mark: 0,
             event_tx,
             event_rx,
             cancel_tx,
@@ -206,7 +213,13 @@ impl App {
     /// Build a new Agent from current state.
     fn build_agent(&self) -> Agent {
         let cfg = self.config.read();
-        let pc = ProviderConfig::new(&cfg.llm.default_provider, &cfg.llm.default_model, "");
+        let mut pc = ProviderConfig::new(&cfg.llm.default_provider, &cfg.llm.default_model, "");
+        if !cfg.llm.default_base_url.is_empty() {
+            pc.base_url = Some(cfg.llm.default_base_url.clone());
+        }
+        if cfg.llm.tls.insecure_skip_verify {
+            pc.insecure_skip_verify = true;
+        }
         let provider = create_provider(&pc)
             .unwrap_or_else(|_| create_provider(&ProviderConfig::new("mock", "mock", "")).unwrap());
         let sp = cfg.llm.system_prompt.content.clone();
@@ -225,6 +238,8 @@ impl App {
             match event {
                 AgentEvent::TurnStart { turn } => {
                     self.current_turn = turn;
+                    // Record current line count so we can trim streaming text later
+                    self.streaming_mark = self.chat.line_count();
                     self.chat
                         .add_line(format!("  🤖 Assistant (turn {turn})"), &self.styles);
                 }
@@ -239,7 +254,13 @@ impl App {
                     let block = render_tool_result("", "tool", &result, &self.styles);
                     self.chat.add_block(block);
                 }
-                AgentEvent::TurnEnd { .. } => {
+                AgentEvent::TurnEnd { assistant, .. } => {
+                    // Trim streaming text back to the mark
+                    self.chat.truncate_to(self.streaming_mark);
+                    // Render assistant content as formatted markdown blocks
+                    for block in render_assistant_message(&assistant.content, &self.styles) {
+                        self.chat.add_block(block);
+                    }
                     self.chat.add_separator(&self.styles);
                 }
                 AgentEvent::End {

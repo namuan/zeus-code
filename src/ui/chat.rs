@@ -57,6 +57,16 @@ impl ChatLog {
         self.scroll = 0;
     }
 
+    /// Truncate lines to the given length (keep first `len` lines).
+    pub fn truncate_to(&mut self, len: usize) {
+        self.lines.truncate(len);
+    }
+
+    /// Current number of lines in the chat.
+    pub fn line_count(&self) -> usize {
+        self.lines.len()
+    }
+
     pub fn scroll_up(&mut self, amount: u16) {
         self.scroll = self.scroll.saturating_add(amount);
     }
@@ -70,23 +80,19 @@ impl ChatLog {
     }
 
     pub fn render(&self, f: &mut Frame, area: Rect, styles: &Styles) {
-        let total_lines = self.lines.len() as u16;
-        let visible = area.height.saturating_sub(1);
-        if total_lines == 0 || visible == 0 {
+        use ratatui::widgets::Wrap;
+
+        if self.lines.is_empty() || area.height == 0 {
             return;
         }
 
-        let start = if total_lines > visible {
-            let max_scroll = total_lines - visible;
-            let scroll = self.scroll.min(max_scroll);
-            (total_lines - visible - scroll) as usize
-        } else {
-            0
-        };
-
-        let end = (start + visible as usize).min(self.lines.len());
-        let visible_lines: Vec<Line> = self.lines[start..end].to_vec();
-        let p = Paragraph::new(visible_lines).style(styles.base());
+        // Pass all lines so the Paragraph can reflow with wrapping.
+        // Scroll offset is in visual rows (after wrapping), not logical lines.
+        let scroll_offset = self.scroll;
+        let p = Paragraph::new(self.lines.clone())
+            .style(styles.base())
+            .wrap(Wrap { trim: false })
+            .scroll((scroll_offset, 0u16));
         f.render_widget(p, area);
     }
 }
