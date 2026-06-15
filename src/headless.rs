@@ -52,6 +52,45 @@ async fn run_headless_inner(cli: Cli, prompt_arg: Option<String>) -> KonResult<i
         }
     };
 
+    // 1a. Intercept shell command prefixes before any LLM work.
+    // !command: pure shell, no LLM, exit with the command's status.
+    // !!command: execute, capture output, then send command+output to the LLM.
+    let prompt =
+        if let Some((send_to_llm, command)) = crate::shell_intercept::parse_shell_prefix(&prompt) {
+            let result = crate::shell_intercept::execute_shell(
+                &command,
+                crate::shell_intercept::DEFAULT_TIMEOUT_MS,
+            )
+            .await?;
+
+            // Echo the output so the user can see what happened.
+            if let Some(ref output) = result.result {
+                print!("{output}");
+            }
+            if let Some(ref details) = result.ui_details_full
+                && details != result.result.as_deref().unwrap_or("")
+            {
+                eprint!("{details}");
+            }
+            if !result.success {
+                eprintln!(
+                    "zeus: shell command exited with non-zero status: {}",
+                    result.ui_summary.as_deref().unwrap_or("?")
+                );
+            }
+
+            if !send_to_llm {
+                // !command: stop here, propagate the command's exit status.
+                return Ok(if result.success { 0 } else { 1 });
+            }
+
+            // !!command: replace the prompt with the formatted command+output
+            // so the LLM sees it as the user message.
+            crate::shell_intercept::format_command_output(&command, &result)
+        } else {
+            prompt
+        };
+
     // 2. Load config and apply CLI overrides
     let mut config = config::Config::load_or_create();
     config.merge_cli_overrides(&cli);

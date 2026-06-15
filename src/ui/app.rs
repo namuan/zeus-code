@@ -490,6 +490,66 @@ impl App {
             return;
         }
 
+        // Check for shell commands (! / !!)
+        if let Some((send_to_llm, command)) = crate::shell_intercept::parse_shell_prefix(text) {
+            // !!command cannot run while the agent is already producing output —
+            // run_agent() is a no-op in that case, so we'd silently drop the LLM
+            // handoff. Reject explicitly so the user understands.
+            if send_to_llm && self.agent_running {
+                self.chat.add_block(render_status(
+                    "Cannot run !!command while agent is running — try !command or wait.",
+                    &self.styles,
+                    true,
+                ));
+                return;
+            }
+
+            let command = command.to_string();
+
+            // Display the command itself as a "You" message so the user sees
+            // what was sent, including the ! / !! prefix.
+            self.chat.scroll_to_bottom();
+            self.chat.add_line(String::new(), &self.styles);
+            let user_block = render_user_message(text, None, &self.styles);
+            self.chat.add_block(user_block);
+
+            // Add a "Running…" placeholder line that will be replaced when
+            // the result arrives via the event channel.
+            self.working_mark = Some(self.chat.line_count());
+            self.working_start = Some(Instant::now());
+            self.chat
+                .add_line("  … Running shell command…".to_string(), &self.styles);
+
+            // Spawn async execution. We do not block the UI thread — results
+            // flow back through the existing event channel.
+            let event_tx = self.event_tx.clone();
+            tokio::spawn(async move {
+                let result = crate::shell_intercept::execute_shell(
+                    &command,
+                    crate::shell_intercept::DEFAULT_TIMEOUT_MS,
+                )
+                .await
+                .unwrap_or_else(|e| crate::core::types::ToolResult {
+                    success: false,
+                    result: Some(format!("{e}")),
+                    images: vec![],
+                    ui_summary: Some(format!("Shell error: {e}")),
+                    ui_details: None,
+                    ui_details_full: None,
+                    file_changes: None,
+                });
+                let _ = event_tx
+                    .send(AgentEvent::ShellResult {
+                        command,
+                        result,
+                        send_to_llm,
+                    })
+                    .await;
+            });
+
+            return; // Do not fall through to run_agent()
+        }
+
         // Regular input → run agent
         self.chat.scroll_to_bottom();
         self.run_agent(text);
@@ -604,6 +664,33 @@ impl App {
                     self.connecting_start = None;
                     self.chat
                         .add_line(format!("  ✗ Error: {error}"), &self.styles);
+                }
+                AgentEvent::ShellResult {
+                    command,
+                    result,
+                    send_to_llm,
+                } => {
+                    // Remove the "Running shell command…" placeholder
+                    if let Some(mark) = self.working_mark.take() {
+                        self.chat.truncate_to(mark);
+                    }
+                    self.working_start = None;
+
+                    // Render the output using the existing tool-result renderer.
+                    // The name "shell" makes it visually distinct from agent
+                    // tool calls in the chat.
+                    let block = render_tool_result("", "shell", &result, &self.styles);
+                    self.chat.add_block(block);
+
+                    // For !!command: forward command + output to the LLM as
+                    // context. run_agent() spawns a new task; the LLM's
+                    // response will arrive as subsequent events.
+                    if send_to_llm {
+                        let augmented =
+                            crate::shell_intercept::format_command_output(&command, &result);
+                        self.chat.scroll_to_bottom();
+                        self.run_agent(&augmented);
+                    }
                 }
 
                 _ => {}

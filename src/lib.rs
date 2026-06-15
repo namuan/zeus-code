@@ -7,6 +7,7 @@ pub mod r#loop;
 pub mod notify;
 pub mod permissions;
 pub mod session;
+pub mod shell_intercept;
 pub mod themes;
 pub mod turn;
 

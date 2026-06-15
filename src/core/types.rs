@@ -118,7 +118,7 @@ pub struct FileChanges {
     pub diff: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ToolResult {
     pub success: bool,
     pub result: Option<String>,
@@ -215,6 +215,13 @@ pub enum AgentEvent {
     },
     Error {
         error: String,
+    },
+    /// Result of a `!command` / `!!command` shell execution. Routes from the
+    /// async spawn back to the TUI for rendering and optional LLM forwarding.
+    ShellResult {
+        command: String,
+        result: ToolResult,
+        send_to_llm: bool,
     },
 }
 
@@ -508,6 +515,27 @@ mod tests {
         };
         match event {
             AgentEvent::Error { error } => assert_eq!(error, "something went wrong"),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_agent_event_shell_result_construction() {
+        let ev = AgentEvent::ShellResult {
+            command: "ls".into(),
+            result: ToolResult::default(),
+            send_to_llm: false,
+        };
+        match ev {
+            AgentEvent::ShellResult {
+                command,
+                result,
+                send_to_llm,
+            } => {
+                assert_eq!(command, "ls");
+                assert!(!result.success);
+                assert!(!send_to_llm);
+            }
             _ => panic!("wrong variant"),
         }
     }
