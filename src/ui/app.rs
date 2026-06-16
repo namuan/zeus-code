@@ -479,6 +479,9 @@ impl App {
                         false,
                     ));
                 }
+                Command::Compact => {
+                    self.handle_compact_command();
+                }
                 _ => {
                     self.chat.add_block(render_status(
                         &format!("Command not yet implemented: {text}"),
@@ -553,6 +556,85 @@ impl App {
         // Regular input → run agent
         self.chat.scroll_to_bottom();
         self.run_agent(text);
+    }
+
+    /// Handle the `/compact` slash command. Spawns a background task that
+    /// runs `Agent::compact_now` against the current session and routes
+    /// the result back through the event channel as an
+    /// `AgentEvent::CompactionResult`. The session is moved in and out of
+    /// the shared `Arc<Mutex<Option<Session>>>` for the duration of the
+    /// call, mirroring `run_agent`.
+    fn handle_compact_command(&mut self) {
+        if self.agent_running {
+            self.chat.add_block(render_status(
+                "Cannot compact while agent is running — wait for it to finish.",
+                &self.styles,
+                true,
+            ));
+            return;
+        }
+
+        // Take the session out. If there is none, there is nothing to do.
+        let mut session_guard = self.session.lock();
+        let Some(mut session) = session_guard.take() else {
+            drop(session_guard);
+            self.chat.add_block(render_status(
+                "Nothing to compact — no active session.",
+                &self.styles,
+                false,
+            ));
+            return;
+        };
+        drop(session_guard);
+
+        // Show a "Compacting…" placeholder that the spawned task will
+        // replace on completion via AgentEvent::CompactionResult.
+        self.working_mark = Some(self.chat.line_count());
+        self.working_start = Some(Instant::now());
+        self.chat
+            .add_line("  ⏳ Compacting…".to_string(), &self.styles);
+        self.chat.scroll_to_bottom();
+
+        // Build the agent and channels for the background task.
+        let agent = self.build_agent();
+        let event_tx = self.event_tx.clone();
+        let cancel_rx = self.cancel_rx.clone();
+        let session_arc = Arc::clone(&self.session);
+
+        tokio::spawn(async move {
+            let result = agent
+                .compact_now(&mut session, event_tx.clone(), cancel_rx)
+                .await;
+
+            // Always put the session back, even on error, so subsequent
+            // turns see the post-compaction state.
+            *session_arc.lock() = Some(session);
+
+            let event = match result {
+                Ok(Some(summary)) => AgentEvent::CompactionResult {
+                    success: true,
+                    no_op: false,
+                    summary_length: summary.summary.len(),
+                    tokens_before: summary.tokens_before,
+                    error: None,
+                },
+                Ok(None) => AgentEvent::CompactionResult {
+                    success: true,
+                    no_op: true,
+                    summary_length: 0,
+                    tokens_before: 0,
+                    error: None,
+                },
+                Err(e) => AgentEvent::CompactionResult {
+                    success: false,
+                    no_op: false,
+                    summary_length: 0,
+                    tokens_before: 0,
+                    error: Some(format!("{e}")),
+                },
+            };
+            let _ = event_tx.send(event).await;
+        });
     }
 
     /// Process agent events from the channel.
@@ -690,6 +772,39 @@ impl App {
                             crate::shell_intercept::format_command_output(&command, &result);
                         self.chat.scroll_to_bottom();
                         self.run_agent(&augmented);
+                    }
+                }
+
+                AgentEvent::CompactionResult {
+                    success,
+                    no_op,
+                    summary_length,
+                    tokens_before,
+                    error,
+                } => {
+                    // Remove the "Compacting…" placeholder line.
+                    if let Some(mark) = self.working_mark.take() {
+                        self.chat.truncate_to(mark);
+                    }
+                    self.working_start = None;
+
+                    if no_op {
+                        self.chat.add_line(
+                            "  ℹ Nothing to compact — need at least 2 user turns.".to_string(),
+                            &self.styles,
+                        );
+                    } else if success {
+                        self.chat.add_line(
+                            format!(
+                                "  ✓ Compacted conversation ({} tokens → {} chars summary)",
+                                tokens_before, summary_length
+                            ),
+                            &self.styles,
+                        );
+                    } else {
+                        let msg = error.as_deref().unwrap_or("unknown error");
+                        self.chat
+                            .add_line(format!("  ✗ Compaction failed: {msg}"), &self.styles);
                     }
                 }
 
@@ -1303,63 +1418,62 @@ mod tests {
             "should show result summary"
         );
     }
-}
 
-/// Test-only helper to process a single event.
-#[cfg(test)]
-impl App {
-    fn process_event_for_test(&mut self, event: AgentEvent) {
-        match event {
-            AgentEvent::TurnStart { turn } => {
-                self.current_turn = turn;
-                self.streaming_buffer.clear();
-                self.streaming_thinking.clear();
-                self.streaming_mark = self.chat.line_count();
-                self.chat
-                    .add_line(format!("  🤖 Assistant (turn {turn})"), &self.styles);
-                self.chat.add_styled_line("  …", self.styles.dim_text());
-            }
-            AgentEvent::ThinkingDelta { text, .. } => {
-                self.streaming_thinking.push_str(&text);
-                self.redraw_streaming();
-            }
-            AgentEvent::TextDelta { text } => {
-                self.streaming_buffer.push_str(&text);
-                self.redraw_streaming();
-            }
-            AgentEvent::ToolStart { id, name, .. } => {
-                self.chat.add_line(format!("  🔧 {name}"), &self.styles);
-                self.args_progress_mark = Some(self.chat.line_count());
-                self.chat.add_line(String::new(), &self.styles);
-                self.pending_tools.insert(id, name);
-            }
-            AgentEvent::ToolEnd { id, arguments, .. } => {
-                self.args_bytes.remove(&id);
-                self.args_progress_mark = None;
-                if let Some(name) = self.pending_tools.remove(&id)
-                    && let Some(preview) = format_tool_preview(&name, &arguments)
-                {
+    /// Test-only helper to process a single event.
+    impl App {
+        fn process_event_for_test(&mut self, event: AgentEvent) {
+            match event {
+                AgentEvent::TurnStart { turn } => {
+                    self.current_turn = turn;
+                    self.streaming_buffer.clear();
+                    self.streaming_thinking.clear();
+                    self.streaming_mark = self.chat.line_count();
                     self.chat
-                        .add_styled_line(&preview, self.styles.thinking_text());
-                    self.working_mark = Some(self.chat.line_count());
-                    self.working_start = Some(Instant::now());
-                    self.chat
-                        .add_line("  | Working (0.0s)…".to_string(), &self.styles);
+                        .add_line(format!("  🤖 Assistant (turn {turn})"), &self.styles);
+                    self.chat.add_styled_line("  …", self.styles.dim_text());
                 }
-            }
-            AgentEvent::ToolResult { result, .. } => {
-                if let Some(mark) = self.working_mark.take() {
-                    self.chat.truncate_to(mark);
+                AgentEvent::ThinkingDelta { text, .. } => {
+                    self.streaming_thinking.push_str(&text);
+                    self.redraw_streaming();
                 }
-                let block = render_tool_result("", "tool", &result, &self.styles);
-                self.chat.add_block(block);
+                AgentEvent::TextDelta { text } => {
+                    self.streaming_buffer.push_str(&text);
+                    self.redraw_streaming();
+                }
+                AgentEvent::ToolStart { id, name, .. } => {
+                    self.chat.add_line(format!("  🔧 {name}"), &self.styles);
+                    self.args_progress_mark = Some(self.chat.line_count());
+                    self.chat.add_line(String::new(), &self.styles);
+                    self.pending_tools.insert(id, name);
+                }
+                AgentEvent::ToolEnd { id, arguments, .. } => {
+                    self.args_bytes.remove(&id);
+                    self.args_progress_mark = None;
+                    if let Some(name) = self.pending_tools.remove(&id)
+                        && let Some(preview) = format_tool_preview(&name, &arguments)
+                    {
+                        self.chat
+                            .add_styled_line(&preview, self.styles.thinking_text());
+                        self.working_mark = Some(self.chat.line_count());
+                        self.working_start = Some(Instant::now());
+                        self.chat
+                            .add_line("  | Working (0.0s)…".to_string(), &self.styles);
+                    }
+                }
+                AgentEvent::ToolResult { result, .. } => {
+                    if let Some(mark) = self.working_mark.take() {
+                        self.chat.truncate_to(mark);
+                    }
+                    let block = render_tool_result("", "tool", &result, &self.styles);
+                    self.chat.add_block(block);
+                }
+                _ => {}
             }
-            _ => {}
         }
-    }
 
-    /// Collect all chat line content into a single string for assertions.
-    fn chat_lines_as_string(&self) -> String {
-        self.chat.all_text()
+        /// Collect all chat line content into a single string for assertions.
+        fn chat_lines_as_string(&self) -> String {
+            self.chat.all_text()
+        }
     }
 }

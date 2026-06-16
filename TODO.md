@@ -4,7 +4,7 @@ Features listed in the README that are not yet implemented or are only partially
 
 ## Not Implemented
 
-- [/] **Shell command integration** (`!command`, `!!command`) — no code exists. Prefix handling, command execution, and output routing are all missing. Currently all text goes to the LLM.
+- [x] **Shell command integration** (`!command`, `!!command`) — fully implemented. Prefix parsing in `src/shell_intercept.rs`, async execution with timeout, output rendering in TUI via `AgentEvent::ShellResult`, and optional LLM forwarding with `!!command`.
 
 - [ ] **Anthropic provider** (`src/llm/providers/anthropic.rs`) — 2-line stub. Needs full API implementation with streaming, tool calls, and thinking support.
 
@@ -16,12 +16,11 @@ Features listed in the README that are not yet implemented or are only partially
 
 ## Partially Implemented
 
-- [/] **Self-compacting context** — token estimation and overflow detection work, but `generate_summary()` returns a hardcoded stub. The LLM is never called to produce a real summary (`src/core/compaction.rs` line 127).
+- [x] **Self-compacting context** — fully implemented. `generate_summary()` makes real LLM calls via `Provider::stream`. The agent loop detects overflow via `should_compact()`, splits at the last user turn, summarizes earlier messages, and persists `SessionEntry::Compaction`. `/compact` slash command triggers manual compaction. Summaries injected as system messages via `active_messages()`.
 
-- [ ] **Slash commands** — only 4 of 12 work (`/help`, `/quit`, `/clear`, `/new`). Still stubbed:
+- [ ] **Slash commands** — 5 of 12 work (`/help`, `/quit`, `/clear`, `/new`, `/compact`). Still stubbed:
   - `/model` — change provider/model at runtime
   - `/resume` — load a previous session
-  - `/compact` — trigger context compaction
   - `/themes` — cycle through color themes
   - `/thinking` — toggle thinking level
   - `/permissions` — switch permission mode

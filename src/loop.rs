@@ -10,7 +10,9 @@ use parking_lot::RwLock;
 use tokio::sync::{mpsc, watch};
 
 use crate::config::Config;
-use crate::core::compaction::{CompactionConfig, OnOverflow, generate_summary, should_compact};
+use crate::core::compaction::{
+    CompactionConfig, CompactionSummary, OnOverflow, generate_summary, should_compact,
+};
 use crate::core::errors::KonResult;
 use crate::core::types::{AgentEvent, Message, StopReason, Usage, UserMessage};
 use crate::llm::base::Provider;
@@ -171,61 +173,25 @@ impl Agent {
                 self.compaction_config.buffer_tokens,
                 &tool_definitions,
             ) {
-                // Identify messages to summarize vs. keep.
-                let (to_summarize, first_kept_id) = find_compaction_split(&session.entries);
-
-                if to_summarize.is_empty() {
-                    tracing::debug!("Compaction triggered but no messages to summarize");
-                } else {
-                    let _ = event_tx.send(AgentEvent::CompactionStart).await;
-
-                    match generate_summary(
-                        self.provider.as_ref(),
-                        &to_summarize,
-                        first_kept_id,
-                        cancel_rx.clone(),
-                    )
+                match self
+                    .compact_now(session, event_tx.clone(), cancel_rx.clone())
                     .await
-                    {
-                        Ok(summary) => {
-                            // Persist the compaction to the session.
-                            let entry = SessionEntry::Compaction {
-                                id: Session::next_entry_id(),
-                                parent_id: session
-                                    .entries
-                                    .last()
-                                    .and_then(|e| e.id())
-                                    .unwrap_or("root")
-                                    .to_string(),
-                                timestamp: chrono::Utc::now().to_rfc3339(),
-                                summary: summary.summary.clone(),
-                                first_kept_entry_id: summary.first_kept_entry_id.clone(),
-                                tokens_before: summary.tokens_before,
-                            };
-                            session.append_entry(entry).await?;
-
-                            // Emit real CompactionEnd.
-                            let _ = event_tx
-                                .send(AgentEvent::CompactionEnd {
-                                    summary: summary.summary,
-                                    tokens_before: summary.tokens_before,
-                                })
-                                .await;
-                        }
-                        Err(e) => {
-                            tracing::warn!("Compaction failed: {e}");
-                            let _ = event_tx
-                                .send(AgentEvent::Error {
-                                    error: format!("Compaction failed: {e}"),
-                                })
-                                .await;
+                {
+                    Ok(Some(_)) => {
+                        // Honor OnOverflow::Pause.
+                        if self.compaction_config.on_overflow == OnOverflow::Pause {
+                            stop_reason = StopReason::EndTurn;
+                            break;
                         }
                     }
-
-                    // Honor OnOverflow::Pause.
-                    if self.compaction_config.on_overflow == OnOverflow::Pause {
-                        stop_reason = StopReason::EndTurn;
-                        break;
+                    Ok(None) => {
+                        tracing::debug!("Compaction triggered but no messages to summarize");
+                    }
+                    Err(e) => {
+                        // Per ADR: failed compaction is non-fatal. The
+                        // `Error` event was already emitted by
+                        // `compact_now`; we just continue the loop.
+                        tracing::warn!("Compaction failed (continuing): {e}");
                     }
                 }
             }
@@ -250,6 +216,88 @@ impl Agent {
             total_turns,
             usage: total_usage,
         })
+    }
+
+    /// Manually trigger context compaction on the current session.
+    ///
+    /// This is the implementation behind the `/compact` slash command and
+    /// is also reused by the automatic threshold-driven path inside
+    /// [`Agent::run`]. It always attempts to compact, regardless of the
+    /// current token count, so the user can force a shrink at any time.
+    ///
+    /// Behaviour:
+    ///
+    /// - Splits the session's active path at the last user message.
+    /// - If there is nothing to summarize (no user messages, or only the
+    ///   most recent one), returns `Ok(None)` and emits no events.
+    /// - Otherwise emits `CompactionStart`, calls the LLM for a summary,
+    ///   persists a `SessionEntry::Compaction` to `session`, and emits
+    ///   `CompactionEnd` with the result.
+    /// - On summarization failure, emits `AgentEvent::Error` and returns
+    ///   the underlying error. The caller decides whether to propagate or
+    ///   swallow it; the agent loop swallows it (per the ADR's
+    ///   "failed compaction is non-fatal" decision) and the TUI surfaces
+    ///   the error to the user.
+    pub async fn compact_now(
+        &self,
+        session: &mut Session,
+        event_tx: mpsc::Sender<AgentEvent>,
+        cancel_rx: watch::Receiver<bool>,
+    ) -> KonResult<Option<CompactionSummary>> {
+        // Identify messages to summarize vs. keep.
+        let (to_summarize, first_kept_id) = find_compaction_split(&session.entries);
+
+        if to_summarize.is_empty() {
+            return Ok(None);
+        }
+
+        let _ = event_tx.send(AgentEvent::CompactionStart).await;
+
+        match generate_summary(
+            self.provider.as_ref(),
+            &to_summarize,
+            first_kept_id,
+            cancel_rx,
+        )
+        .await
+        {
+            Ok(summary) => {
+                // Persist the compaction to the session.
+                let entry = SessionEntry::Compaction {
+                    id: Session::next_entry_id(),
+                    parent_id: session
+                        .entries
+                        .last()
+                        .and_then(|e| e.id())
+                        .unwrap_or("root")
+                        .to_string(),
+                    timestamp: chrono::Utc::now().to_rfc3339(),
+                    summary: summary.summary.clone(),
+                    first_kept_entry_id: summary.first_kept_entry_id.clone(),
+                    tokens_before: summary.tokens_before,
+                };
+                session.append_entry(entry).await?;
+
+                // Emit real CompactionEnd.
+                let _ = event_tx
+                    .send(AgentEvent::CompactionEnd {
+                        summary: summary.summary.clone(),
+                        tokens_before: summary.tokens_before,
+                    })
+                    .await;
+
+                Ok(Some(summary))
+            }
+            Err(e) => {
+                tracing::warn!("Compaction failed: {e}");
+                let _ = event_tx
+                    .send(AgentEvent::Error {
+                        error: format!("Compaction failed: {e}"),
+                    })
+                    .await;
+                Err(e)
+            }
+        }
     }
 }
 
@@ -728,6 +776,251 @@ mod tests {
         assert!(
             has_system_summary,
             "expected active_messages to contain the compaction summary"
+        );
+    }
+
+    // ── compact_now direct-method tests ───────────────────────────────
+    //
+    // These tests exercise `Agent::compact_now` directly (i.e. without
+    // the surrounding agent loop), which is exactly the code path the
+    // `/compact` slash command hits. The existing
+    // `test_agent_compaction_triggers_and_persists` test covers the
+    // inline / automatic path; these cover the manual path and the edge
+    // cases (empty session, single user, cancellation).
+
+    /// Build a session with two user turns, suitable for compaction.
+    async fn build_two_user_session() -> Session {
+        use crate::core::types::{ContentBlock, UserMessage};
+
+        let mut session = Session::new(PathBuf::from("/tmp/test-compact-now"), "sp".into(), vec![])
+            .await
+            .unwrap();
+
+        let _ = session
+            .append_user_message(UserMessage {
+                content: vec![ContentBlock::Text {
+                    text: "earlier question".into(),
+                }],
+                skill_name: None,
+            })
+            .await
+            .unwrap();
+        let _ = session
+            .append_assistant_message(
+                vec![ContentBlock::Text {
+                    text: "earlier response".into(),
+                }],
+                None,
+                Some(StopReason::Stop),
+            )
+            .await
+            .unwrap();
+        let _ = session
+            .append_user_message(UserMessage {
+                content: vec![ContentBlock::Text {
+                    text: "follow-up question".into(),
+                }],
+                skill_name: None,
+            })
+            .await
+            .unwrap();
+        let _ = session
+            .append_assistant_message(
+                vec![ContentBlock::Text {
+                    text: "follow-up response".into(),
+                }],
+                None,
+                Some(StopReason::Stop),
+            )
+            .await
+            .unwrap();
+
+        session
+    }
+
+    #[tokio::test]
+    async fn test_compact_now_succeeds_on_two_user_session() {
+        let config = Arc::new(RwLock::new(Config::load_defaults()));
+        let provider = Box::new(MockProvider::new("mock".into()));
+        let agent = Agent::new(config, provider);
+        let mut session = build_two_user_session().await;
+
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+        let summary = agent
+            .compact_now(&mut session, event_tx, cancel_rx)
+            .await
+            .expect("compact_now should succeed with the mock provider")
+            .expect("compact_now should return Some(summary) for a 2-user session");
+
+        assert!(!summary.summary.is_empty());
+        assert!(summary.tokens_before > 0);
+        assert!(!summary.first_kept_entry_id.is_empty());
+
+        // CompactionStart and CompactionEnd events were both emitted.
+        let mut saw_start = false;
+        let mut saw_end = false;
+        while let Ok(event) = event_rx.try_recv() {
+            match event {
+                AgentEvent::CompactionStart => saw_start = true,
+                AgentEvent::CompactionEnd { .. } => saw_end = true,
+                _ => {}
+            }
+        }
+        assert!(saw_start, "expected CompactionStart event");
+        assert!(saw_end, "expected CompactionEnd event");
+
+        // A Compaction entry was appended to the session.
+        let compaction_count = session
+            .entries
+            .iter()
+            .filter(|e| matches!(e, SessionEntry::Compaction { .. }))
+            .count();
+        assert_eq!(compaction_count, 1);
+
+        // active_messages() now contains the summary as a system message.
+        let active = session.active_messages();
+        let has_summary = active
+            .iter()
+            .any(|m| matches!(m, Message::System(s) if s.content == summary.summary));
+        assert!(
+            has_summary,
+            "expected active_messages to contain the compaction summary"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_compact_now_empty_session_returns_none() {
+        let config = Arc::new(RwLock::new(Config::load_defaults()));
+        let provider = Box::new(MockProvider::new("mock".into()));
+        let agent = Agent::new(config, provider);
+        let mut session = Session::new(
+            PathBuf::from("/tmp/test-compact-empty"),
+            "sp".into(),
+            vec![],
+        )
+        .await
+        .unwrap();
+
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+        let result = agent
+            .compact_now(&mut session, event_tx, cancel_rx)
+            .await
+            .expect("compact_now should not error on an empty session");
+
+        assert!(result.is_none(), "expected None for an empty session");
+
+        // No events should have been emitted for the no-op case.
+        assert!(
+            event_rx.try_recv().is_err(),
+            "expected no events for the empty-session no-op"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_compact_now_single_user_session_returns_none() {
+        use crate::core::types::{ContentBlock, UserMessage};
+
+        let config = Arc::new(RwLock::new(Config::load_defaults()));
+        let provider = Box::new(MockProvider::new("mock".into()));
+        let agent = Agent::new(config, provider);
+        let mut session = Session::new(
+            PathBuf::from("/tmp/test-compact-single"),
+            "sp".into(),
+            vec![],
+        )
+        .await
+        .unwrap();
+        let _ = session
+            .append_user_message(UserMessage {
+                content: vec![ContentBlock::Text {
+                    text: "only user message".into(),
+                }],
+                skill_name: None,
+            })
+            .await
+            .unwrap();
+
+        let (event_tx, _event_rx) = mpsc::channel(16);
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+        let result = agent
+            .compact_now(&mut session, event_tx, cancel_rx)
+            .await
+            .expect("compact_now should not error on a single-user session");
+
+        assert!(
+            result.is_none(),
+            "expected None when only one user message exists"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_compact_now_cancellation_propagates() {
+        use crate::core::types::{ContentBlock, UserMessage};
+
+        let config = Arc::new(RwLock::new(Config::load_defaults()));
+        let provider = Box::new(MockProvider::new("mock".into()));
+        let agent = Agent::new(config, provider);
+        let mut session = Session::new(
+            PathBuf::from("/tmp/test-compact-cancel"),
+            "sp".into(),
+            vec![],
+        )
+        .await
+        .unwrap();
+        // Two user messages so there *is* something to compact.
+        let _ = session
+            .append_user_message(UserMessage {
+                content: vec![ContentBlock::Text {
+                    text: "first".into(),
+                }],
+                skill_name: None,
+            })
+            .await
+            .unwrap();
+        let _ = session
+            .append_assistant_message(
+                vec![ContentBlock::Text { text: "ok".into() }],
+                None,
+                Some(StopReason::Stop),
+            )
+            .await
+            .unwrap();
+        let _ = session
+            .append_user_message(UserMessage {
+                content: vec![ContentBlock::Text {
+                    text: "second".into(),
+                }],
+                skill_name: None,
+            })
+            .await
+            .unwrap();
+
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        // Pre-cancel.
+        cancel_tx.send(true).unwrap();
+
+        let (event_tx, _event_rx) = mpsc::channel(16);
+        let result = agent.compact_now(&mut session, event_tx, cancel_rx).await;
+
+        assert!(
+            matches!(result, Err(KonError::Cancelled)),
+            "expected Cancelled error, got {result:?}"
+        );
+
+        // No Compaction entry should have been appended.
+        let compaction_count = session
+            .entries
+            .iter()
+            .filter(|e| matches!(e, SessionEntry::Compaction { .. }))
+            .count();
+        assert_eq!(
+            compaction_count, 0,
+            "cancelled compaction must not persist a Compaction entry"
         );
     }
 }

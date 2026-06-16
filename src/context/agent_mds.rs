@@ -98,7 +98,7 @@ mod tests {
         let has_agents = docs
             .files
             .iter()
-            .any(|(p, _)| p.file_name().map_or(false, |n| n == "AGENTS.md"));
+            .any(|(p, _)| p.file_name().is_some_and(|n| n == "AGENTS.md"));
         assert!(has_agents);
     }
 

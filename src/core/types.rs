@@ -208,6 +208,23 @@ pub enum AgentEvent {
         summary: String,
         tokens_before: u64,
     },
+    /// Result of a manually triggered `/compact` slash command. Emitted by
+    /// the TUI's spawned compaction task so the UI can render a status
+    /// line. The agent loop ignores this event.
+    CompactionResult {
+        /// `true` if compaction succeeded (including the no-op case).
+        success: bool,
+        /// `true` when there was nothing meaningful to compact (fewer than
+        /// two user turns in the active path).
+        no_op: bool,
+        /// Character length of the generated summary (`0` on no-op/error).
+        summary_length: usize,
+        /// Token count of the messages that were summarized (`0` on
+        /// no-op/error).
+        tokens_before: u64,
+        /// Human-readable error message; `None` on success.
+        error: Option<String>,
+    },
     End {
         stop_reason: StopReason,
         total_turns: u64,

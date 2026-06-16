@@ -247,7 +247,7 @@ mod tests {
         let mut chat = ChatLog::new();
         let styles = crate::ui::styles::Styles::default_theme();
         // One very long line that should wrap to multiple visual rows
-        chat.add_line(format!("{}", "=".repeat(200)), &styles);
+        chat.add_line("=".repeat(200), &styles);
         chat.add_line("bottom line".to_string(), &styles);
 
         // Render at width 40 — the long line should wrap to 5 rows (200/40)
