@@ -3,7 +3,7 @@ use once_cell::sync::Lazy;
 use crate::llm::base::ThinkingLevel;
 
 /// Static model catalog entry.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Model {
     pub id: String,
     pub provider: String,
@@ -311,6 +311,17 @@ pub fn find_model(provider: &str, model_id: &str) -> Option<Model> {
         .iter()
         .find(|m| m.provider == provider && m.id == model_id)
         .cloned()
+}
+
+/// Find all models matching a given model ID across all providers.
+/// Used by `/model` resolution when the user provides only a model name
+/// without specifying the provider.
+pub fn find_models_by_id(model_id: &str) -> Vec<Model> {
+    MODELS
+        .iter()
+        .filter(|m| m.id == model_id)
+        .cloned()
+        .collect()
 }
 
 /// Return all models for a given provider.

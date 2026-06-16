@@ -18,8 +18,7 @@ Features listed in the README that are not yet implemented or are only partially
 
 - [x] **Self-compacting context** — fully implemented. `generate_summary()` makes real LLM calls via `Provider::stream`. The agent loop detects overflow via `should_compact()`, splits at the last user turn, summarizes earlier messages, and persists `SessionEntry::Compaction`. `/compact` slash command triggers manual compaction. Summaries injected as system messages via `active_messages()`.
 
-- [ ] **Slash commands** — 5 of 12 work (`/help`, `/quit`, `/clear`, `/new`, `/compact`). Still stubbed:
-  - `/model` — change provider/model at runtime
+- [ ] **Slash commands** — 6 of 12 work (`/help`, `/quit`, `/clear`, `/new`, `/compact`, `/model`). Still stubbed:
   - `/resume` — load a previous session
   - `/themes` — cycle through color themes
   - `/thinking` — toggle thinking level

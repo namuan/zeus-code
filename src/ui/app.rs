@@ -24,6 +24,7 @@ use crate::ui::blocks::{
 use crate::ui::chat::ChatLog;
 use crate::ui::commands::{Command, parse_command};
 use crate::ui::input::InputBox;
+use crate::ui::model_popup::ModelPopup;
 use crate::ui::styles::Styles;
 use crate::ui::widgets;
 
@@ -41,6 +42,8 @@ pub struct App {
     pub chat: ChatLog,
     pub input: InputBox,
     pub autocomplete: AutocompleteState,
+    /// Model-selector popup (shown when `/model` has no argument).
+    pub model_popup: ModelPopup,
     /// Cached list of all project files (populated on first `@`).
     all_files: Vec<String>,
 
@@ -111,6 +114,7 @@ impl App {
             chat: ChatLog::new(),
             input: InputBox::new(),
             autocomplete: AutocompleteState::inactive(),
+            model_popup: ModelPopup::default(),
             all_files: Vec::new(),
             pending_tools: std::collections::HashMap::new(),
             args_bytes: std::collections::HashMap::new(),
@@ -138,6 +142,27 @@ impl App {
     /// Handle a key event from crossterm.
     pub fn handle_key(&mut self, key: crossterm::event::KeyEvent) {
         use crossterm::event::{KeyCode, KeyModifiers};
+
+        // ── Model popup is active: handle its keys first ───────────
+        if self.model_popup.active {
+            match key.code {
+                KeyCode::Esc => {
+                    self.model_popup.dismiss();
+                }
+                KeyCode::Up => self.model_popup.select_prev(),
+                KeyCode::Down => self.model_popup.select_next(),
+                KeyCode::PageUp => self.model_popup.page_up(),
+                KeyCode::PageDown => self.model_popup.page_down(),
+                KeyCode::Enter => {
+                    if let Some((provider, model_id)) = self.model_popup.accept() {
+                        self.apply_model_switch(&provider, &model_id);
+                        self.model_popup.dismiss();
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
 
         // ── Autocomplete is active: handle completion keys first ──────
         if self.autocomplete.active {
@@ -309,8 +334,9 @@ impl App {
         self.agent_handle = Some(handle);
     }
 
-    /// Build a new Agent from current state.
-    fn build_agent(&self) -> Agent {
+    /// Build a provider from the current config values (without constructing
+    /// a full Agent). Used by `/model` to update `self.provider` in-place.
+    fn build_provider(&self) -> Box<dyn Provider> {
         let cfg = self.config.read();
         let mut pc = ProviderConfig::new(&cfg.llm.default_provider, &cfg.llm.default_model, "");
         if !cfg.llm.default_base_url.is_empty() {
@@ -319,10 +345,13 @@ impl App {
         if cfg.llm.tls.insecure_skip_verify {
             pc.insecure_skip_verify = true;
         }
-        let provider = create_provider(&pc)
-            .unwrap_or_else(|_| create_provider(&ProviderConfig::new("mock", "mock", "")).unwrap());
-        drop(cfg);
+        create_provider(&pc)
+            .unwrap_or_else(|_| create_provider(&ProviderConfig::new("mock", "mock", "")).unwrap())
+    }
 
+    /// Build a new Agent from current state.
+    fn build_agent(&self) -> Agent {
+        let provider = self.build_provider();
         Agent::new(self.config.clone(), provider)
     }
 
@@ -482,6 +511,9 @@ impl App {
                 Command::Compact => {
                     self.handle_compact_command();
                 }
+                Command::Model(ref arg) => {
+                    self.handle_model_command(arg);
+                }
                 _ => {
                     self.chat.add_block(render_status(
                         &format!("Command not yet implemented: {text}"),
@@ -635,6 +667,63 @@ impl App {
             };
             let _ = event_tx.send(event).await;
         });
+    }
+
+    /// Handle the `/model <arg>` slash command. Resolves the argument into
+    /// a provider + model pair, updates the shared config and the app-level
+    /// provider, and renders the result in the chat. Unlike `/compact`,
+    /// this is synchronous — no LLM call or I/O is needed.
+    fn handle_model_command(&mut self, arg: &str) {
+        use crate::ui::model_switch::{ModelSwitch, format_switch_result, resolve_model_switch};
+
+        let result = resolve_model_switch(arg);
+
+        match &result {
+            ModelSwitch::Switch {
+                provider, model_id, ..
+            } => {
+                self.apply_model_switch(provider, model_id);
+                self.chat.add_block(render_status(
+                    &format_switch_result(&result),
+                    &self.styles,
+                    false,
+                ));
+            }
+            ModelSwitch::ShowCatalog => {
+                // Activate the interactive popup instead of rendering
+                // the catalog as a static chat message.
+                self.model_popup.activate();
+            }
+            _ => {
+                // NotFound, Ambiguous, ProviderNotImplemented
+                self.chat.add_block(render_status(
+                    &format_switch_result(&result),
+                    &self.styles,
+                    true,
+                ));
+            }
+        }
+    }
+
+    /// Apply a model switch: update config, rebuild provider, and render
+    /// a confirmation message. Called by both the direct `/model gpt-4o`
+    /// path and the popup's Enter key handler.
+    fn apply_model_switch(&mut self, provider: &str, model_id: &str) {
+        // Update the shared config so the next turn picks up the new model.
+        {
+            let mut cfg = self.config.write();
+            cfg.llm.default_provider = provider.to_string();
+            cfg.llm.default_model = model_id.to_string();
+        }
+
+        // Rebuild the app-level provider for consistency.
+        self.provider = self.build_provider();
+
+        self.chat.add_block(render_status(
+            &format!("✓ Switched to {provider}/{model_id}",),
+            &self.styles,
+            false,
+        ));
     }
 
     /// Process agent events from the channel.
@@ -866,6 +955,9 @@ impl App {
 
         // Autocomplete popup (renders on top of everything)
         self.autocomplete.render(f, &self.styles);
+
+        // Model selector popup (renders on top of everything)
+        self.model_popup.render(f, &self.styles);
     }
 }
 

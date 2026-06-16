@@ -335,12 +335,19 @@ impl Config {
 
 /// Sensible default model when a user switches providers via --provider
 /// without also specifying --model.
-fn default_model_for_provider(provider: &str) -> String {
+///
+/// Must return a model ID that exists in `src/llm/models.rs` for the given
+/// provider, otherwise callers that look up the returned ID via
+/// `find_model(provider, id)` will panic.
+pub(crate) fn default_model_for_provider(provider: &str) -> String {
     match provider {
+        "openai" => "gpt-4o".into(),
         "openrouter" => "openrouter/free".into(),
-        "deepseek" => "deepseek/deepseek-chat".into(),
+        "deepseek" => "deepseek-v4-pro".into(),
+        "zhipu" => "glm-5-plus".into(),
         "anthropic" => "claude-sonnet-4-5-20250929".into(),
         "github-copilot" => "gpt-5.5".into(),
+        "mock" => "mock".into(),
         _ => "gpt-4o".into(),
     }
 }
