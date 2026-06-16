@@ -1,8 +1,11 @@
+use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json;
+use tokio::sync::watch;
 
-use crate::core::errors::KonResult;
+use crate::core::errors::{KonError, KonResult};
 use crate::core::types::{Message, ToolDefinition};
+use crate::llm::base::Provider;
 
 /// Token estimation: rough heuristic (characters ÷ 4).
 /// This is a fast approximation for English text; a real tokenizer would be more accurate,
@@ -120,18 +123,176 @@ pub struct CompactionSummary {
     pub first_kept_entry_id: String,
 }
 
+/// Per-message character limit when serializing for the summarization prompt.
+/// Prevents the prompt from being as large as the conversation itself.
+const MAX_ENTRY_CHARS: usize = 2000;
+
+/// Instruction sent to the LLM when asking it to summarize the conversation.
+const SUMMARIZATION_INSTRUCTION: &str = "You are a conversation summarizer. Summarize the \
+conversation below so it can be used as compact context for continuing the work.\n\n\
+Preserve:\n\
+- Key decisions and their rationale\n\
+- File changes (which files, what was done)\n\
+- Unresolved questions or pending tasks\n\
+- Important context (variables, environment, user constraints)\n\n\
+Be concise but thorough. Output plain text, no markdown headers needed.";
+
 /// Generate a summary of the conversation using the LLM.
 ///
-/// This is a stub — the full implementation requires a provider reference,
-/// which will be wired up in Phase 7 (Agent Loop).
-pub fn generate_summary(_messages: &[Message], _max_tokens: u64) -> KonResult<CompactionSummary> {
-    // Stub — will be implemented in Phase 7.
-    // In practice, this sends a summarization prompt to the LLM:
-    //   "Summarize the conversation so far, preserving key decisions,
-    //    file changes, and unresolved questions..."
-    Err(crate::core::errors::KonError::Other(
-        "compaction summary generation not yet implemented".into(),
-    ))
+/// Serializes the messages to summarize into a textual form, sends a
+/// summarization prompt to the provider, collects the streamed text response,
+/// and returns it together with token counts before/after compaction.
+///
+/// `first_kept_entry_id` is stored in the returned summary so that
+/// `Session::active_messages()` can skip the summarized range on subsequent
+/// turns.
+///
+/// Honours the provided `watch::Receiver<bool>` cancellation channel: if the
+/// stream is cancelled mid-flight, a `KonError::Cancelled` is returned and any
+/// partial summary is discarded.
+pub async fn generate_summary(
+    provider: &dyn Provider,
+    messages_to_summarize: &[Message],
+    first_kept_entry_id: String,
+    mut cancel: watch::Receiver<bool>,
+) -> KonResult<CompactionSummary> {
+    // Guard: nothing to summarize.
+    if messages_to_summarize.is_empty() {
+        return Err(KonError::Other("nothing to summarize".into()));
+    }
+
+    // Build the prompt.
+    let serialized = messages_to_summary_prompt_text(messages_to_summarize);
+    let prompt_body =
+        format!("{SUMMARIZATION_INSTRUCTION}\n\n<conversation>\n{serialized}\n</conversation>");
+    let prompt_message = Message::User(crate::core::types::UserMessage {
+        content: vec![crate::core::types::ContentBlock::Text { text: prompt_body }],
+        skill_name: None,
+    });
+
+    // Open the stream.
+    let mut stream = provider
+        .stream(vec![prompt_message], None, Vec::new(), cancel.clone())
+        .await?;
+
+    // Collect the streamed text.
+    let mut summary_text = String::new();
+    loop {
+        // Check cancellation before blocking on the stream.
+        if *cancel.borrow() {
+            return Err(KonError::Cancelled);
+        }
+
+        let part = tokio::select! {
+            result = stream.inner.next() => {
+                match result {
+                    Some(part) => part,
+                    None => break, // stream ended without StreamDone
+                }
+            }
+            _ = cancel.changed() => {
+                return Err(KonError::Cancelled);
+            }
+        };
+
+        let part = part?;
+        match part {
+            crate::core::types::StreamPart::TextDelta { text } => {
+                summary_text.push_str(&text);
+            }
+            crate::core::types::StreamPart::StreamDone { .. } => {
+                break;
+            }
+            // Ignore thinking, tool calls (we requested no tools), signatures,
+            // and error parts here — a stream-level error is handled below by
+            // `?` on the next iteration's part.
+            _ => {}
+        }
+    }
+
+    // Compute token counts.
+    let tokens_before: u64 = messages_to_summarize
+        .iter()
+        .map(estimate_message_tokens)
+        .sum();
+    let tokens_after = estimate_tokens(&summary_text);
+
+    Ok(CompactionSummary {
+        summary: summary_text,
+        tokens_before,
+        tokens_after,
+        first_kept_entry_id,
+    })
+}
+
+/// Serialize a slice of messages to a labeled textual form, truncating each
+/// entry to `MAX_ENTRY_CHARS` characters. Thinking blocks are skipped to keep
+/// the summarization prompt focused on user-visible content.
+fn messages_to_summary_prompt_text(messages: &[Message]) -> String {
+    let mut out = String::new();
+    for (idx, msg) in messages.iter().enumerate() {
+        if idx > 0 {
+            out.push('\n');
+        }
+        match msg {
+            Message::User(m) => {
+                let text = join_text_blocks(&m.content);
+                out.push_str("User: ");
+                out.push_str(&truncate(&text, MAX_ENTRY_CHARS));
+            }
+            Message::Assistant(m) => {
+                let mut pieces: Vec<String> = Vec::new();
+                for block in &m.content {
+                    match block {
+                        crate::core::types::ContentBlock::Text { text } => {
+                            pieces.push(text.clone());
+                        }
+                        crate::core::types::ContentBlock::ToolCall {
+                            name, arguments, ..
+                        } => {
+                            pieces.push(format!("[tool_call: {name}({arguments})]"));
+                        }
+                        // Skip thinking and image blocks from the summary prompt.
+                        _ => {}
+                    }
+                }
+                out.push_str("Assistant: ");
+                out.push_str(&truncate(&pieces.join(" "), MAX_ENTRY_CHARS));
+            }
+            Message::ToolResult(m) => {
+                out.push_str(&format!("Tool Result ({}): ", m.tool_name));
+                out.push_str(&truncate(&m.content, MAX_ENTRY_CHARS));
+            }
+            Message::System(m) => {
+                out.push_str("System: ");
+                out.push_str(&truncate(&m.content, MAX_ENTRY_CHARS));
+            }
+        }
+    }
+    out
+}
+
+/// Concatenate the text portions of a slice of content blocks.
+fn join_text_blocks(blocks: &[crate::core::types::ContentBlock]) -> String {
+    let mut out = String::new();
+    for (i, block) in blocks.iter().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        if let crate::core::types::ContentBlock::Text { text } = block {
+            out.push_str(text);
+        }
+    }
+    out
+}
+
+/// Truncate `s` to at most `max_chars`, appending a marker when truncated.
+fn truncate(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+    let truncated: String = s.chars().take(max_chars).collect();
+    format!("{truncated}…[truncated]")
 }
 
 #[cfg(test)]
@@ -247,8 +408,174 @@ mod tests {
     }
 
     #[test]
-    fn test_generate_summary_stub_returns_error() {
-        let result = generate_summary(&[], 1000);
+    fn test_generate_summary_empty_messages_returns_error() {
+        // Build a dummy provider; the empty-input guard short-circuits
+        // before the provider is invoked.
+        let provider = crate::llm::providers::mock::MockProvider::new("mock".into());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let result = runtime.block_on(generate_summary(&provider, &[], "kept-1".into(), cancel_rx));
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_generate_summary_with_mock_provider() {
+        use crate::llm::providers::mock::MockProvider;
+
+        let provider = MockProvider::new("mock".into());
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+        let messages = vec![
+            Message::User(UserMessage {
+                content: vec![ContentBlock::Text {
+                    text: "Please refactor the config loader.".into(),
+                }],
+                skill_name: None,
+            }),
+            Message::Assistant(AssistantMessage {
+                content: vec![ContentBlock::Text {
+                    text: "I'll read the file first.".into(),
+                }],
+                usage: None,
+                stop_reason: Some(StopReason::Stop),
+            }),
+            Message::User(UserMessage {
+                content: vec![ContentBlock::Text {
+                    text: "Sounds good.".into(),
+                }],
+                skill_name: None,
+            }),
+        ];
+
+        let summary = generate_summary(&provider, &messages, "kept-1".into(), cancel_rx)
+            .await
+            .expect("summarization should succeed with the mock provider");
+
+        // The mock provider returns canned text; it should appear in the summary.
+        assert!(!summary.summary.is_empty());
+        assert!(
+            summary.tokens_before > 0,
+            "tokens_before should reflect the input messages"
+        );
+        assert!(
+            summary.tokens_after > 0,
+            "tokens_after should reflect the summary text"
+        );
+        assert_eq!(summary.first_kept_entry_id, "kept-1");
+    }
+
+    #[tokio::test]
+    async fn test_generate_summary_cancellation() {
+        use crate::llm::providers::mock::MockProvider;
+
+        let provider = MockProvider::new("mock".into());
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        cancel_tx.send(true).unwrap();
+
+        let messages = vec![Message::User(UserMessage {
+            content: vec![ContentBlock::Text { text: "hi".into() }],
+            skill_name: None,
+        })];
+
+        let result = generate_summary(&provider, &messages, "kept-1".into(), cancel_rx).await;
+        assert!(matches!(result, Err(KonError::Cancelled)));
+    }
+
+    #[test]
+    fn test_messages_to_summary_prompt_text_user() {
+        let msgs = vec![Message::User(UserMessage {
+            content: vec![ContentBlock::Text {
+                text: "hello".into(),
+            }],
+            skill_name: None,
+        })];
+        let out = messages_to_summary_prompt_text(&msgs);
+        assert!(out.contains("User: hello"));
+    }
+
+    #[test]
+    fn test_messages_to_summary_prompt_text_assistant_tool_call() {
+        let msgs = vec![Message::Assistant(AssistantMessage {
+            content: vec![
+                ContentBlock::Text {
+                    text: "Reading".into(),
+                },
+                ContentBlock::ToolCall {
+                    id: "c1".into(),
+                    name: "read".into(),
+                    arguments: r#"{"file_path":"x.rs"}"#.into(),
+                },
+            ],
+            usage: None,
+            stop_reason: Some(StopReason::ToolUse),
+        })];
+        let out = messages_to_summary_prompt_text(&msgs);
+        assert!(out.contains("Assistant:"));
+        assert!(out.contains("Reading"));
+        assert!(out.contains("[tool_call: read("));
+    }
+
+    #[test]
+    fn test_messages_to_summary_prompt_text_skips_thinking() {
+        let msgs = vec![Message::Assistant(AssistantMessage {
+            content: vec![
+                ContentBlock::Thinking {
+                    thinking: "internal reasoning".into(),
+                    signature: None,
+                    level: Some("low".into()),
+                },
+                ContentBlock::Text {
+                    text: "external answer".into(),
+                },
+            ],
+            usage: None,
+            stop_reason: Some(StopReason::Stop),
+        })];
+        let out = messages_to_summary_prompt_text(&msgs);
+        assert!(!out.contains("internal reasoning"));
+        assert!(out.contains("external answer"));
+    }
+
+    #[test]
+    fn test_messages_to_summary_prompt_text_truncates_long_entries() {
+        let long = "x".repeat(MAX_ENTRY_CHARS + 100);
+        let msgs = vec![Message::User(UserMessage {
+            content: vec![ContentBlock::Text { text: long }],
+            skill_name: None,
+        })];
+        let out = messages_to_summary_prompt_text(&msgs);
+        assert!(out.contains("…[truncated]"));
+        // Should not contain the full original text length.
+        assert!(out.len() < MAX_ENTRY_CHARS + 100 + 20);
+    }
+
+    #[tokio::test]
+    async fn test_summarization_prompt_contains_conversation() {
+        use crate::llm::providers::mock::MockProvider;
+
+        let provider = MockProvider::new("mock".into());
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+        let messages = vec![Message::User(UserMessage {
+            content: vec![ContentBlock::Text {
+                text: "FIX-MARKER-ABC".into(),
+            }],
+            skill_name: None,
+        })];
+
+        // The mock provider ignores the prompt content for its canned response,
+        // but we can verify our serialization helper produces the expected fence.
+        let serialized = messages_to_summary_prompt_text(&messages);
+        assert!(serialized.contains("FIX-MARKER-ABC"));
+
+        // Exercise the full path so we know the prompt is wired through
+        // provider.stream() without error.
+        let summary = generate_summary(&provider, &messages, "kept-x".into(), cancel_rx)
+            .await
+            .unwrap();
+        assert!(!summary.summary.is_empty());
     }
 }

@@ -4,7 +4,7 @@ Features listed in the README that are not yet implemented or are only partially
 
 ## Not Implemented
 
-- [ ] **Shell command integration** (`!command`, `!!command`) — no code exists. Prefix handling, command execution, and output routing are all missing. Currently all text goes to the LLM.
+- [/] **Shell command integration** (`!command`, `!!command`) — no code exists. Prefix handling, command execution, and output routing are all missing. Currently all text goes to the LLM.
 
 - [ ] **Anthropic provider** (`src/llm/providers/anthropic.rs`) — 2-line stub. Needs full API implementation with streaming, tool calls, and thinking support.
 
@@ -16,7 +16,7 @@ Features listed in the README that are not yet implemented or are only partially
 
 ## Partially Implemented
 
-- [ ] **Self-compacting context** — token estimation and overflow detection work, but `generate_summary()` returns a hardcoded stub. The LLM is never called to produce a real summary (`src/core/compaction.rs` line 127).
+- [/] **Self-compacting context** — token estimation and overflow detection work, but `generate_summary()` returns a hardcoded stub. The LLM is never called to produce a real summary (`src/core/compaction.rs` line 127).
 
 - [ ] **Slash commands** — only 4 of 12 work (`/help`, `/quit`, `/clear`, `/new`). Still stubbed:
   - `/model` — change provider/model at runtime

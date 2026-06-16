@@ -10,12 +10,12 @@ use parking_lot::RwLock;
 use tokio::sync::{mpsc, watch};
 
 use crate::config::Config;
-use crate::core::compaction::{CompactionConfig, should_compact};
+use crate::core::compaction::{CompactionConfig, OnOverflow, generate_summary, should_compact};
 use crate::core::errors::KonResult;
-use crate::core::types::{AgentEvent, StopReason, Usage, UserMessage};
+use crate::core::types::{AgentEvent, Message, StopReason, Usage, UserMessage};
 use crate::llm::base::Provider;
 use crate::permissions::PermissionMode;
-use crate::session::Session;
+use crate::session::{Session, SessionEntry};
 use crate::tools::base::Tool;
 use crate::tools::{self as tools_mod};
 use crate::turn::TurnRunner;
@@ -171,16 +171,63 @@ impl Agent {
                 self.compaction_config.buffer_tokens,
                 &tool_definitions,
             ) {
-                let _ = event_tx.send(AgentEvent::CompactionStart).await;
-                // Compaction summary will be implemented in Phase 10
-                // For now, just log that compaction would occur
-                tracing::info!("Context compaction triggered (stub)");
-                let _ = event_tx
-                    .send(AgentEvent::CompactionEnd {
-                        summary: "Compaction summary stub".into(),
-                        tokens_before: 0,
-                    })
-                    .await;
+                // Identify messages to summarize vs. keep.
+                let (to_summarize, first_kept_id) = find_compaction_split(&session.entries);
+
+                if to_summarize.is_empty() {
+                    tracing::debug!("Compaction triggered but no messages to summarize");
+                } else {
+                    let _ = event_tx.send(AgentEvent::CompactionStart).await;
+
+                    match generate_summary(
+                        self.provider.as_ref(),
+                        &to_summarize,
+                        first_kept_id,
+                        cancel_rx.clone(),
+                    )
+                    .await
+                    {
+                        Ok(summary) => {
+                            // Persist the compaction to the session.
+                            let entry = SessionEntry::Compaction {
+                                id: Session::next_entry_id(),
+                                parent_id: session
+                                    .entries
+                                    .last()
+                                    .and_then(|e| e.id())
+                                    .unwrap_or("root")
+                                    .to_string(),
+                                timestamp: chrono::Utc::now().to_rfc3339(),
+                                summary: summary.summary.clone(),
+                                first_kept_entry_id: summary.first_kept_entry_id.clone(),
+                                tokens_before: summary.tokens_before,
+                            };
+                            session.append_entry(entry).await?;
+
+                            // Emit real CompactionEnd.
+                            let _ = event_tx
+                                .send(AgentEvent::CompactionEnd {
+                                    summary: summary.summary,
+                                    tokens_before: summary.tokens_before,
+                                })
+                                .await;
+                        }
+                        Err(e) => {
+                            tracing::warn!("Compaction failed: {e}");
+                            let _ = event_tx
+                                .send(AgentEvent::Error {
+                                    error: format!("Compaction failed: {e}"),
+                                })
+                                .await;
+                        }
+                    }
+
+                    // Honor OnOverflow::Pause.
+                    if self.compaction_config.on_overflow == OnOverflow::Pause {
+                        stop_reason = StopReason::EndTurn;
+                        break;
+                    }
+                }
             }
 
             // Check stop reason
@@ -203,6 +250,65 @@ impl Agent {
             total_turns,
             usage: total_usage,
         })
+    }
+}
+
+// ── Compaction split helper ──────────────────────────────────────────────
+
+/// Walk the active path through `entries` and split it into the messages to
+/// summarize and the ID of the first kept message.
+///
+/// The split point is the **last** user message in the active path:
+/// everything before it (including earlier user/assistant turns) goes to the
+/// summary, and the last user message onward is kept intact. This preserves
+/// the in-flight turn's context while compacting history.
+///
+/// Returns `(to_summarize, first_kept_entry_id)`. If there is nothing useful
+/// to summarize (no user messages, or only a single user message at the start
+/// of the path), the returned vector is empty and the ID is the empty string;
+/// the caller is expected to skip compaction in that case.
+fn find_compaction_split(entries: &[SessionEntry]) -> (Vec<Message>, String) {
+    // Walk the active path. Each element is (entry_id, message).
+    let mut path: Vec<(&str, &Message)> = Vec::new();
+    let mut current_id: Option<&str> = entries.first().and_then(|e| e.id());
+
+    while let Some(id) = current_id {
+        let entry = entries.iter().find(|e| e.id() == Some(id));
+        match entry {
+            Some(SessionEntry::MessageEntry { message, .. }) => {
+                path.push((id, message));
+            }
+            Some(SessionEntry::Compaction {
+                first_kept_entry_id,
+                ..
+            }) => {
+                // Mirror `Session::active_messages`: jump to the first kept
+                // entry after a compaction.
+                current_id = Some(first_kept_entry_id);
+                continue;
+            }
+            _ => {}
+        }
+        current_id = entries
+            .iter()
+            .rfind(|e| e.parent_id() == Some(id))
+            .and_then(|e| e.id());
+    }
+
+    // Find the last user message in the active path.
+    let last_user_idx = path
+        .iter()
+        .rposition(|(_, m)| matches!(m, Message::User(_)));
+
+    match last_user_idx {
+        Some(0) => (Vec::new(), String::new()),
+        Some(idx) => {
+            let first_kept_id = path[idx].0.to_string();
+            let to_summarize: Vec<Message> =
+                path[..idx].iter().map(|(_, m)| (*m).clone()).collect();
+            (to_summarize, first_kept_id)
+        }
+        None => (Vec::new(), String::new()),
     }
 }
 
@@ -386,5 +492,242 @@ mod tests {
         assert!(prompt.contains("Zeus"));
         assert!(prompt.contains("Tool Usage Guidelines"));
         assert!(!prompt.is_empty());
+    }
+
+    // ── Compaction tests ─────────────────────────────────────────────
+
+    /// Build a session whose active path is:
+    ///   header → user-1 → assistant-1 → user-2 → assistant-2
+    async fn build_split_test_session() -> Session {
+        use crate::core::types::{ContentBlock, UserMessage};
+
+        let mut session = Session::new(PathBuf::from("/tmp/test"), "sp".into(), vec![])
+            .await
+            .unwrap();
+
+        let _ = session
+            .append_user_message(UserMessage {
+                content: vec![ContentBlock::Text {
+                    text: "first user".into(),
+                }],
+                skill_name: None,
+            })
+            .await
+            .unwrap();
+
+        let _ = session
+            .append_assistant_message(
+                vec![ContentBlock::Text {
+                    text: "first assistant".into(),
+                }],
+                None,
+                Some(StopReason::Stop),
+            )
+            .await
+            .unwrap();
+
+        let _ = session
+            .append_user_message(UserMessage {
+                content: vec![ContentBlock::Text {
+                    text: "second user".into(),
+                }],
+                skill_name: None,
+            })
+            .await
+            .unwrap();
+
+        let _ = session
+            .append_assistant_message(
+                vec![ContentBlock::Text {
+                    text: "second assistant".into(),
+                }],
+                None,
+                Some(StopReason::Stop),
+            )
+            .await
+            .unwrap();
+
+        session
+    }
+
+    #[tokio::test]
+    async fn test_find_compaction_split_basic() {
+        let session = build_split_test_session().await;
+        let (to_summarize, first_kept_id) = find_compaction_split(&session.entries);
+
+        // The last user message is "second user" — the path before it is
+        // [user-1, assistant-1].
+        assert_eq!(to_summarize.len(), 2);
+        assert!(matches!(to_summarize[0], Message::User(_)));
+        assert!(matches!(to_summarize[1], Message::Assistant(_)));
+        assert!(!first_kept_id.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_find_compaction_split_single_user_returns_empty() {
+        use crate::core::types::{ContentBlock, UserMessage};
+
+        let mut session = Session::new(PathBuf::from("/tmp/test"), "sp".into(), vec![])
+            .await
+            .unwrap();
+        let _ = session
+            .append_user_message(UserMessage {
+                content: vec![ContentBlock::Text {
+                    text: "only message".into(),
+                }],
+                skill_name: None,
+            })
+            .await
+            .unwrap();
+
+        let (to_summarize, first_kept_id) = find_compaction_split(&session.entries);
+        assert!(to_summarize.is_empty());
+        assert!(first_kept_id.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_find_compaction_split_no_user_returns_empty() {
+        use crate::core::types::ContentBlock;
+
+        let mut session = Session::new(PathBuf::from("/tmp/test"), "sp".into(), vec![])
+            .await
+            .unwrap();
+        let _ = session
+            .append_assistant_message(
+                vec![ContentBlock::Text {
+                    text: "no user message in this session".into(),
+                }],
+                None,
+                Some(StopReason::Stop),
+            )
+            .await
+            .unwrap();
+
+        let (to_summarize, first_kept_id) = find_compaction_split(&session.entries);
+        assert!(to_summarize.is_empty());
+        assert!(first_kept_id.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_agent_compaction_triggers_and_persists() {
+        use crate::core::compaction::OnOverflow;
+        use crate::core::types::{ContentBlock, UserMessage};
+
+        // Build a config with a tiny context window so compaction triggers
+        // on the first turn.
+        let mut config = Config::load_defaults();
+        config.agent.default_context_window = 100;
+        config.compaction.buffer_tokens = 0;
+        config.compaction.on_overflow = OnOverflow::Continue;
+        let config = Arc::new(RwLock::new(config));
+        let provider = Box::new(MockProvider::new("mock".into()));
+        let agent = Agent::new(config, provider);
+        let mut session = Session::new(PathBuf::from("/tmp/test"), "sp".into(), vec![])
+            .await
+            .unwrap();
+
+        // Pre-populate the session with a prior user message and assistant
+        // turn. The new "hello" user message will be the second user message,
+        // giving `find_compaction_split` something to summarize.
+        let _ = session
+            .append_user_message(UserMessage {
+                content: vec![ContentBlock::Text {
+                    text: "earlier question".into(),
+                }],
+                skill_name: None,
+            })
+            .await
+            .unwrap();
+        let _ = session
+            .append_assistant_message(
+                vec![ContentBlock::Text {
+                    text: "earlier response".into(),
+                }],
+                None,
+                Some(StopReason::Stop),
+            )
+            .await
+            .unwrap();
+
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+        // The session is moved into the spawn, so collect the events and the
+        // final session state through the channel + a follow-up helper task.
+        let (session_tx, mut session_rx) = mpsc::channel::<Session>(1);
+        let handle = tokio::spawn(async move {
+            let result = agent
+                .run(&mut session, "hello".into(), None, event_tx, cancel_rx)
+                .await;
+            // Send the session back for post-run assertions.
+            let _ = session_tx.send(session).await;
+            result
+        });
+
+        let mut events = Vec::new();
+        let timeout_dur = std::time::Duration::from_secs(5);
+        loop {
+            tokio::select! {
+                event = event_rx.recv() => {
+                    match event {
+                        Some(e) => {
+                            let is_end = matches!(e, AgentEvent::End { .. });
+                            events.push(e);
+                            if is_end {
+                                break;
+                            }
+                        }
+                        None => break,
+                    }
+                }
+                _ = tokio::time::sleep(timeout_dur) => {
+                    break;
+                }
+            }
+        }
+
+        let result = handle.await.unwrap().unwrap();
+        let session = session_rx.recv().await.expect("session was sent");
+        assert!(matches!(result.stop_reason, StopReason::Stop));
+
+        // CompactionStart was emitted.
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::CompactionStart)),
+            "expected CompactionStart event"
+        );
+
+        // CompactionEnd was emitted with a non-empty summary.
+        let compact_end = events
+            .iter()
+            .find_map(|e| match e {
+                AgentEvent::CompactionEnd { summary, .. } => Some(summary.clone()),
+                _ => None,
+            })
+            .expect("expected CompactionEnd event");
+        assert!(!compact_end.is_empty());
+
+        // A Compaction entry was appended to the session.
+        let compactions: Vec<&SessionEntry> = session
+            .entries
+            .iter()
+            .filter(|e| matches!(e, SessionEntry::Compaction { .. }))
+            .collect();
+        assert_eq!(
+            compactions.len(),
+            1,
+            "expected exactly one Compaction entry"
+        );
+
+        // active_messages() returns the summary as a system message.
+        let active = session.active_messages();
+        let has_system_summary = active
+            .iter()
+            .any(|m| matches!(m, Message::System(s) if s.content == compact_end));
+        assert!(
+            has_system_summary,
+            "expected active_messages to contain the compaction summary"
+        );
     }
 }

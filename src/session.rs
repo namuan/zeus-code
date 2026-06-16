@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::core::errors::{KonError, KonResult};
-use crate::core::types::{AssistantMessage, Message, StopReason, Usage};
+use crate::core::types::{AssistantMessage, Message, StopReason, SystemMessage, Usage};
 
 // ── Session entry types ──────────────────────────────────────────────────
 
@@ -283,15 +283,30 @@ impl Session {
         Ok(())
     }
 
+    /// Generate a new short entry ID. Used by callers that construct
+    /// `SessionEntry` values directly before calling `append_entry`.
+    pub fn next_entry_id() -> String {
+        short_id()
+    }
+
     /// Get all active (non-compacted) messages for the LLM context.
-    /// Skips compaction entries and walks the tree to find the active path.
+    /// Walks the tree to find the active path; when a `Compaction` entry is
+    /// encountered, its summary is injected as a synthetic system message and
+    /// the walk jumps to `first_kept_entry_id`. A visited-id set guards
+    /// against cycles when the jump target sits inside the same subtree.
     pub fn active_messages(&self) -> Vec<Message> {
         let mut messages = Vec::new();
 
         // Start from the header and follow the newest child at each node
         let mut current_id: Option<&str> = self.entries.first().and_then(|e| e.id());
+        let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         while let Some(id) = current_id {
+            if !visited.insert(id.to_string()) {
+                // Already visited — would cycle. Stop.
+                break;
+            }
+
             // Find the entry with this ID
             let entry = self.entries.iter().find(|e| e.id() == Some(id));
             match entry {
@@ -299,10 +314,19 @@ impl Session {
                     messages.push(message.clone());
                 }
                 Some(SessionEntry::Compaction {
+                    summary,
                     first_kept_entry_id,
                     ..
                 }) => {
-                    // Skip to the first kept entry after compaction
+                    // Inject the compaction summary as a synthetic system
+                    // message so the LLM sees the prior context in compacted
+                    // form on the next turn. Then jump to the first kept
+                    // entry; the visited set breaks the cycle.
+                    if !summary.is_empty() {
+                        messages.push(Message::System(SystemMessage {
+                            content: summary.clone(),
+                        }));
+                    }
                     current_id = Some(first_kept_entry_id);
                     continue;
                 }
@@ -747,6 +771,55 @@ mod tests {
         let messages = session.active_messages();
         assert_eq!(messages.len(), 1);
         assert!(matches!(messages[0], Message::User(_)));
+    }
+
+    #[tokio::test]
+    async fn test_active_messages_includes_compaction_summary() {
+        let mut session = Session::new(test_cwd(), "sp".into(), vec![]).await.unwrap();
+
+        // Add a user message — this is the message we will "keep" after
+        // compaction.
+        let user_id = session
+            .append_user_message(UserMessage {
+                content: vec![ContentBlock::Text {
+                    text: "the kept message".into(),
+                }],
+                skill_name: None,
+            })
+            .await
+            .unwrap();
+
+        // Append a Compaction entry that points at the user message above.
+        let summary_text = "Earlier work: implemented feature X.".to_string();
+        let entry = SessionEntry::Compaction {
+            id: Session::next_entry_id(),
+            parent_id: user_id.clone(),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            summary: summary_text.clone(),
+            first_kept_entry_id: user_id,
+            tokens_before: 0,
+        };
+        session.append_entry(entry).await.unwrap();
+
+        let messages = session.active_messages();
+        assert_eq!(messages.len(), 2);
+        // The walk encounters the kept user message first, then the Compaction
+        // entry (which injects the summary as a synthetic system message).
+        assert!(matches!(messages[0], Message::User(_)));
+        assert!(matches!(messages[1], Message::System(_)));
+        match &messages[1] {
+            Message::System(m) => assert_eq!(m.content, summary_text),
+            _ => unreachable!(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_next_entry_id_unique_and_short() {
+        let a = Session::next_entry_id();
+        let b = Session::next_entry_id();
+        assert_eq!(a.len(), 8);
+        assert_eq!(b.len(), 8);
+        assert_ne!(a, b);
     }
 
     #[test]
