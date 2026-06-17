@@ -15,8 +15,8 @@ use crate::llm::providers::ProviderConfig;
 // ── Config path ──────────────────────────────────────────────────────────
 
 fn config_dir() -> PathBuf {
-    let base = dirs::config_dir().unwrap_or_else(|| PathBuf::from("~/.config"));
-    base.join("zeus")
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("~"));
+    home.join(".config").join("zeus-code")
 }
 
 fn config_path() -> PathBuf {

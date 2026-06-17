@@ -343,7 +343,7 @@ pub enum KonError {
 
 ### File: `src/config.rs`
 
-Port the TOML-based config system. The original stores config at `~/.config/kon/config.toml` — we use the same path (or `~/.config/zeus/config.toml`).
+Port the TOML-based config system. The original stores config at `~/.config/kon/config.toml` — we use `~/.config/zeus-code/config.toml`.
 
 ### Config Structure
 
@@ -725,7 +725,7 @@ pub fn check_permission(tool: &dyn Tool, params: &serde_json::Value, mode: Permi
 
 Sessions are stored as append-only JSONL files at:
 ```
-~/.config/zeus/sessions/<sanitized-cwd>/<timestamp>_<uuid>.jsonl
+~/.config/zeus-code/sessions/<sanitized-cwd>/<timestamp>_<uuid>.jsonl
 ```
 
 ### Entry Types
@@ -1041,8 +1041,8 @@ use clap::{Parser, ValueEnum};
 
 #[derive(Parser)]
 #[command(
-    name = "zeus",
-    about = "Zeus — Minimal coding agent harness",
+    name = "zeus-code",
+    about = "ZeusCode — Minimal coding agent harness",
     version,
     long_about = None
 )]
@@ -1433,7 +1433,7 @@ Sound files embedded via `include_bytes!()` for completion, error, and permissio
 **AGENTS.md / CLAUDE.md discovery:**
 - Walk from current working directory up to git root (or home directory)
 - Load all matching `AGENTS.md` and `CLAUDE.md` files
-- Global override: `~/.config/zeus/AGENTS.md` is loaded first
+- Global override: `~/.config/zeus-code/AGENTS.md` is loaded first
 - Format each file's contents into the system prompt under an `<agents_md>` section
 
 **Skills:**

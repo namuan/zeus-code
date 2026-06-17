@@ -1,7 +1,7 @@
 //! Append-only JSONL session persistence.
 //!
 //! Sessions are stored as lines in a JSONL file under
-//! `~/.config/zeus/sessions/<sanitized-cwd>/<timestamp>_<uuid>.jsonl`.
+//! `~/.config/zeus-code/sessions/<sanitized-cwd>/<timestamp>_<uuid>.jsonl`.
 //!
 //! Each line is a SessionEntry. The tree structure is maintained via
 //! `parent_id` pointers. Sessions are never modified in place — new
@@ -579,13 +579,13 @@ impl ConversationTree {
 
 // ── Session paths ────────────────────────────────────────────────────────
 
-/// Compute the base session directory (~/.zeus-code/sessions).
+/// Compute the base session directory (~/.config/zeus-code/sessions).
 fn sessions_dir() -> PathBuf {
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("~"));
-    home.join(".zeus-code").join("sessions")
+    home.join(".config").join("zeus-code").join("sessions")
 }
 
-/// Compute the full path for a session file: ~/.zeus-code/sessions/{id}.jsonl
+/// Compute the full path for a session file: ~/.config/zeus-code/sessions/{id}.jsonl
 fn session_path(id: &Uuid) -> KonResult<PathBuf> {
     let dir = sessions_dir();
 

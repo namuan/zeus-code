@@ -27,7 +27,7 @@ Or install globally:
 git clone https://github.com/0xku/zeus-code.git
 cd zeus-code
 cargo install --path .
-zeus -p "your prompt" --provider openrouter
+zeus-code -p "your prompt" --provider openrouter
 ```
 
 > **Requirements:** Rust 1.85+ (edition 2024). Install via [rustup](https://rustup.rs).
@@ -44,37 +44,45 @@ zeus -p "your prompt" --provider openrouter
 ## Features
 
 - Interactive TUI with streaming responses
-- Multi-provider support (OpenRouter, OpenAI, Anthropic, GitHub Copilot, Azure, DeepSeek, ZhiPu, local)
+- Multi-provider support via OpenAI-compatible API (OpenRouter, OpenAI, DeepSeek, ZhiPu, GitHub Copilot, local)
 - Append-only session persistence (JSONL)
 - Self-compacting context (the LLM summarizes its own history)
-- Slash commands (`/model`, `/resume`, `/compact`, `/handoff`, `/export`, &hellip;)
 - Shell command integration (`!command`, `!!command`)
+- Slash commands (`/help`, `/quit`, `/clear`, `/new`, `/compact`, `/model`)
 - 15 built-in color themes
-- Audio notifications
+- Terminal bell audio notifications
 - Non-interactive headless mode (`-p`)
 
 ## Providers
+
+The following providers are fully implemented:
 
 | Provider                        | Auth     | Notes                                       |
 |---------------------------------|----------|---------------------------------------------|
 | **OpenRouter**                  | API key  | Free models available via `openrouter/free` |
 | OpenAI                          | API key  | GPT-4o, GPT-5.5, o4-mini                    |
-| Anthropic                       | API key  | Claude Sonnet, Haiku, Opus                  |
-| GitHub Copilot                  | OAuth    | GPT-5.5, Claude via Copilot                 |
-| Azure AI Foundry                | API key  | Anthropic models via Azure                  |
 | DeepSeek                        | API key  | V3, V4                                      |
 | ZhiPu                           | API key  | GLM-5                                       |
+| GitHub Copilot                  | OAuth    | GPT-5.5, Claude via Copilot                 |
 | Local (OpenAI-compatible `/v1`) | Optional | llama.cpp, Ollama, etc.                     |
 
-By default ZeusCode connects to OpenAI Codex. Use the `--provider` flag or set `default_provider` in config to change this.
+Additional providers are stubbed and planned for future releases:
+
+- **Anthropic** (Claude Sonnet, Haiku, Opus)
+- **Azure AI Foundry** (Anthropic models via Azure)
+- **OpenAI Codex Responses** (ChatGPT backend, OAuth)
+- **OpenAI Responses API**
+
+By default ZeusCode connects to OpenAI. Use the `--provider` flag or set `default_provider` in config to change this.
 
 ## Configuration
 
-ZeusCode stores its config at `~/.config/zeus/config.toml`. Created automatically on first run. Key options:
+ZeusCode stores its config at `~/.config/zeus-code/config.toml` (on both macOS and Linux).
+Created automatically on first run. Key options:
 
 ```toml
 [llm]
-default_provider = "openrouter"       # or openai, anthropic, deepseek, etc.
+default_provider = "openrouter"       # or openai, deepseek, etc.
 default_model = "openrouter/free"    # auto-routes to best available free model
 default_thinking_level = "low"
 request_timeout_seconds = 600

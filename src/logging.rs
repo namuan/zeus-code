@@ -1,8 +1,8 @@
 //! File logging with size-based rolling.
 //!
-//! Writes to `~/.zeus-code/logs/zeus.log` and rotates when the file
+//! Writes to `~/.config/zeus-code/logs/zeus-code.log` and rotates when the file
 //! exceeds `MAX_LOG_SIZE`. Keeps `MAX_LOG_FILES` backup files
-//! (zeus.1.log, zeus.2.log, …).
+//! (zeus-code.1.log, zeus-code.2.log, …).
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
@@ -34,7 +34,7 @@ impl RollingWriter {
         let log_dir = log_dir();
         fs::create_dir_all(&log_dir)?;
 
-        let path = log_dir.join("zeus.log");
+        let path = log_dir.join("zeus-code.log");
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
         let size = file.metadata().map(|m| m.len()).unwrap_or(0);
 
@@ -63,7 +63,7 @@ impl RollingWriter {
         let inner = self.inner.lock().unwrap();
         let base = &inner.path;
 
-        // Shift existing backups: zeus.4.log → zeus.5.log, …, zeus.log → zeus.1.log
+        // Shift existing backups: zeus-code.4.log → zeus-code.5.log, …, zeus-code.log → zeus-code.1.log
         for i in (1..=MAX_LOG_FILES).rev() {
             let old = file_with_suffix(base, i);
             let new = file_with_suffix(base, i + 1);
@@ -75,7 +75,7 @@ impl RollingWriter {
                 }
             }
         }
-        // Rename current log to zeus.1.log
+        // Rename current log to zeus-code.1.log
         if base.exists() {
             let backup = file_with_suffix(base, 1);
             let _ = fs::rename(base, &backup);
@@ -116,15 +116,16 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for RollingWriter {
     }
 }
 
-/// Build the log directory path: `~/.zeus-code/logs/`
+/// Build the log directory path: `~/.config/zeus-code/logs/`
 fn log_dir() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join(".zeus-code")
+        .join(".config")
+        .join("zeus-code")
         .join("logs")
 }
 
-/// Create a path with a numeric suffix: `zeus.log` → `zeus.1.log`
+/// Create a path with a numeric suffix: `zeus-code.log` → `zeus-code.1.log`
 fn file_with_suffix(base: &std::path::Path, n: usize) -> PathBuf {
     let stem = base.file_stem().unwrap_or_default().to_string_lossy();
     let ext = base.extension().unwrap_or_default().to_string_lossy();

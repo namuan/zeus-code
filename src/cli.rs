@@ -2,7 +2,11 @@ use clap::Parser;
 
 /// Zeus — Minimal coding agent harness.
 #[derive(Parser)]
-#[command(name = "zeus", version, about = "Zeus — Minimal coding agent harness")]
+#[command(
+    name = "zeus-code",
+    version,
+    about = "Zeus — Minimal coding agent harness"
+)]
 pub struct Cli {
     /// Model to use (overrides config)
     #[arg(short = 'm', long)]

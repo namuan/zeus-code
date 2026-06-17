@@ -59,7 +59,7 @@ Available commands:
   /export       Export session to HTML
   /clear        Clear the screen
   /help         Show this help
-  /quit         Exit Zeus
+  /quit         Exit ZeusCode
 
 Key bindings:
   Enter         Submit input

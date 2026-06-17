@@ -47,7 +47,7 @@ async fn main() {
         None => {
             // TUI mode
             if let Err(e) = zeus_code::ui::launch::run_tui(cli).await {
-                eprintln!("zeus: {e}");
+                eprintln!("zeus-code: {e}");
                 std::process::exit(1);
             }
         }

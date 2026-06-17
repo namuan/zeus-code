@@ -167,7 +167,7 @@ User submits input
 
 ### `config.rs` — Configuration
 
-- Loads/creates `~/.config/zeus/config.toml`
+- Loads/creates `~/.config/zeus-code/config.toml`
 - Deep-merges user config over embedded defaults
 - Schema migrations for backward compatibility
 - Runtime overrides from CLI flags
@@ -207,7 +207,7 @@ User submits input
 
 ### `session.rs` — Persistence
 
-- Append-only JSONL files in `~/.config/zeus/sessions/`
+- Append-only JSONL files in `~/.config/zeus-code/sessions/`
 - Tree structure via parent_id + LeafEntry pointers
 - Session creation, loading, resuming
 - Compaction entries

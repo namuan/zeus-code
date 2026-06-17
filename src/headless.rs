@@ -27,7 +27,7 @@ pub async fn run_headless(cli: Cli, prompt_arg: Option<String>) -> i32 {
     match run_headless_inner(cli, prompt_arg).await {
         Ok(code) => code,
         Err(e) => {
-            eprintln!("zeus: {e}");
+            eprintln!("zeus-code: {e}");
             2
         }
     }
@@ -45,7 +45,7 @@ async fn run_headless_inner(cli: Cli, prompt_arg: Option<String>) -> KonResult<i
             })?;
             let input = input.trim().to_string();
             if input.is_empty() {
-                eprintln!("zeus: no prompt provided and stdin is empty");
+                eprintln!("zeus-code: no prompt provided and stdin is empty");
                 return Ok(2);
             }
             input
@@ -74,7 +74,7 @@ async fn run_headless_inner(cli: Cli, prompt_arg: Option<String>) -> KonResult<i
             }
             if !result.success {
                 eprintln!(
-                    "zeus: shell command exited with non-zero status: {}",
+                    "zeus-code: shell command exited with non-zero status: {}",
                     result.ui_summary.as_deref().unwrap_or("?")
                 );
             }
@@ -204,7 +204,7 @@ async fn run_headless_inner(cli: Cli, prompt_arg: Option<String>) -> KonResult<i
                 break;
             }
             AgentEvent::Error { error } => {
-                eprintln!("\nzeus error: {error}");
+                eprintln!("\nzeus-code error: {error}");
                 exit_code = 1;
                 break;
             }
@@ -215,13 +215,13 @@ async fn run_headless_inner(cli: Cli, prompt_arg: Option<String>) -> KonResult<i
     match handle.await {
         Ok(Ok(_)) => {}
         Ok(Err(e)) => {
-            eprintln!("\nzeus: {e}");
+            eprintln!("\nzeus-code: {e}");
             if exit_code == 0 {
                 exit_code = 1;
             }
         }
         Err(e) => {
-            eprintln!("\nzeus: agent task panicked: {e}");
+            eprintln!("\nzeus-code: agent task panicked: {e}");
             exit_code = 1;
         }
     }
