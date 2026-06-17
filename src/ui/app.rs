@@ -47,6 +47,9 @@ pub struct App {
     /// Cached list of all project files (populated on first `@`).
     all_files: Vec<String>,
 
+    /// API key provided via CLI (used when rebuilding provider via /model).
+    api_key: String,
+
     /// Tool call ID → tool name, used to render a preview when ToolEnd fires.
     pending_tools: std::collections::HashMap<String, String>,
     /// Tool call ID → accumulated argument bytes, for streaming progress.
@@ -102,6 +105,7 @@ impl App {
         provider: Box<dyn Provider>,
         tools: Vec<Box<dyn Tool>>,
         session: Option<Session>,
+        api_key: String,
     ) -> Self {
         let (event_tx, event_rx) = mpsc::channel(128);
         let (cancel_tx, cancel_rx) = watch::channel(false);
@@ -116,6 +120,7 @@ impl App {
             autocomplete: AutocompleteState::inactive(),
             model_popup: ModelPopup::default(),
             all_files: Vec::new(),
+            api_key,
             pending_tools: std::collections::HashMap::new(),
             args_bytes: std::collections::HashMap::new(),
             args_progress_mark: None,
@@ -338,7 +343,11 @@ impl App {
     /// a full Agent). Used by `/model` to update `self.provider` in-place.
     fn build_provider(&self) -> Box<dyn Provider> {
         let cfg = self.config.read();
-        let mut pc = ProviderConfig::new(&cfg.llm.default_provider, &cfg.llm.default_model, "");
+        let mut pc = ProviderConfig::new(
+            &cfg.llm.default_provider,
+            &cfg.llm.default_model,
+            &self.api_key,
+        );
         if !cfg.llm.default_base_url.is_empty() {
             pc.base_url = Some(cfg.llm.default_base_url.clone());
         }
@@ -1046,7 +1055,7 @@ mod tests {
         let provider = create_provider(&ProviderConfig::new("mock", "mock", "")).unwrap();
         let tools: Vec<Box<dyn Tool>> = vec![];
         let session: Option<Session> = None;
-        App::new(config, provider, tools, session)
+        App::new(config, provider, tools, session, String::new())
     }
 
     /// Press a key on the app.
@@ -1273,7 +1282,7 @@ mod tests {
         let config = Arc::new(RwLock::new(Config::load_defaults()));
         let provider = create_provider(&ProviderConfig::new("mock", "mock", "")).unwrap();
         let tools: Vec<Box<dyn Tool>> = vec![];
-        let mut app = App::new(config, provider, tools, Some(session));
+        let mut app = App::new(config, provider, tools, Some(session), String::new());
 
         // Before restore, chat should be empty
         assert_eq!(app.chat.line_count(), 0);

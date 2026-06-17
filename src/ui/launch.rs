@@ -33,7 +33,8 @@ pub async fn run_tui(cli: Cli) -> anyhow::Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     // Build the app
-    let mut app = build_app(config.clone(), cli.continue_session).await?;
+    let api_key = cli.api_key.unwrap_or_default();
+    let mut app = build_app(config.clone(), cli.continue_session, api_key).await?;
 
     // Main event loop
     let result = run_event_loop(&mut terminal, &mut app).await;
@@ -46,11 +47,24 @@ pub async fn run_tui(cli: Cli) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn build_app(config: Arc<RwLock<Config>>, continue_session: bool) -> anyhow::Result<App> {
+async fn build_app(
+    config: Arc<RwLock<Config>>,
+    continue_session: bool,
+    cli_api_key: String,
+) -> anyhow::Result<App> {
     let (provider, tools) = {
         let cfg = config.read();
-        let provider_config =
-            ProviderConfig::new(&cfg.llm.default_provider, &cfg.llm.default_model, "");
+        let mut provider_config = ProviderConfig::new(
+            &cfg.llm.default_provider,
+            &cfg.llm.default_model,
+            &cli_api_key,
+        );
+        if !cfg.llm.default_base_url.is_empty() {
+            provider_config.base_url = Some(cfg.llm.default_base_url.clone());
+        }
+        if cfg.llm.tls.insecure_skip_verify {
+            provider_config.insecure_skip_verify = true;
+        }
         let provider = create_provider(&provider_config).unwrap_or_else(|e| {
             tracing::warn!("{e} — using mock provider");
             create_provider(&ProviderConfig::new("mock", "mock", "")).unwrap()
@@ -74,7 +88,7 @@ async fn build_app(config: Arc<RwLock<Config>>, continue_session: bool) -> anyho
         None
     };
 
-    let mut app = App::new(config, provider, tools, session);
+    let mut app = App::new(config, provider, tools, session, cli_api_key);
     // If a session was restored, render its history into the chat
     app.render_session_history();
     Ok(app)
