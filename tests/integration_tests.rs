@@ -16,7 +16,7 @@ use zeus_code::session::Session;
 #[tokio::test]
 async fn test_full_agent_run_text_response() {
     let config = Arc::new(RwLock::new(Config::load_defaults()));
-    let provider = create_provider(&ProviderConfig::new("mock", "mock", "")).unwrap();
+    let provider = create_provider(&ProviderConfig::mock()).unwrap();
     let cwd = PathBuf::from("/tmp/test-integration");
     let mut session = Session::new(cwd, "test sp".into(), vec![]).await.unwrap();
 

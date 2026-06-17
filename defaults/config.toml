@@ -9,10 +9,6 @@ default_thinking_level = "low"
 tool_call_idle_timeout_seconds = 60
 request_timeout_seconds = 120
 
-[llm.auth]
-openai_compat = "auto"
-anthropic_compat = "auto"
-
 [llm.tls]
 insecure_skip_verify = false
 

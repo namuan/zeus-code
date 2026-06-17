@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::cli::Cli;
 use crate::core::compaction::CompactionConfig;
 use crate::core::errors::{KonError, KonResult};
+use crate::llm::providers::ProviderConfig;
 
 // ── Config path ──────────────────────────────────────────────────────────
 
@@ -34,12 +35,6 @@ pub struct MetaConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AuthConfig {
-    pub openai_compat: String,
-    pub anthropic_compat: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TLSConfig {
     pub insecure_skip_verify: bool,
 }
@@ -60,9 +55,20 @@ pub struct LLMConfig {
     pub default_thinking_level: String,
     pub tool_call_idle_timeout_seconds: u64,
     pub request_timeout_seconds: u64,
-    pub auth: AuthConfig,
     pub tls: TLSConfig,
     pub system_prompt: SystemPromptConfig,
+}
+
+impl LLMConfig {
+    /// Build a ProviderConfig from this LLM config, applying all overrides.
+    pub fn to_provider_config(&self, api_key: &str) -> ProviderConfig {
+        let mut pc = ProviderConfig::new(&self.default_provider, &self.default_model, api_key)
+            .with_insecure_skip_verify(self.tls.insecure_skip_verify);
+        if !self.default_base_url.is_empty() {
+            pc.base_url = Some(self.default_base_url.clone());
+        }
+        pc
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -289,26 +295,16 @@ impl Config {
         value
     }
 
-    /// v1 → v2: Ensure auth and tls subsections exist under [llm].
+    /// v1 → v2: Ensure tls subsection exists under [llm].
     fn migrate_v1_to_v2(mut value: toml::Value) -> toml::Value {
         if let Some(table) = value.as_table_mut()
             && let Some(llm) = table.get_mut("llm")
             && let Some(llm_table) = llm.as_table_mut()
+            && !llm_table.contains_key("tls")
         {
-            if !llm_table.contains_key("auth") {
-                let mut auth = toml::Table::new();
-                auth.insert("openai_compat".into(), toml::Value::String("auto".into()));
-                auth.insert(
-                    "anthropic_compat".into(),
-                    toml::Value::String("auto".into()),
-                );
-                llm_table.insert("auth".into(), toml::Value::Table(auth));
-            }
-            if !llm_table.contains_key("tls") {
-                let mut tls = toml::Table::new();
-                tls.insert("insecure_skip_verify".into(), toml::Value::Boolean(false));
-                llm_table.insert("tls".into(), toml::Value::Table(tls));
-            }
+            let mut tls = toml::Table::new();
+            tls.insert("insecure_skip_verify".into(), toml::Value::Boolean(false));
+            llm_table.insert("tls".into(), toml::Value::Table(tls));
         }
         value
     }
@@ -396,8 +392,6 @@ mod tests {
         assert_eq!(config.llm.default_thinking_level, "low");
         assert_eq!(config.llm.tool_call_idle_timeout_seconds, 60);
         assert_eq!(config.llm.request_timeout_seconds, 120);
-        assert_eq!(config.llm.auth.openai_compat, "auto");
-        assert_eq!(config.llm.auth.anthropic_compat, "auto");
         assert!(!config.llm.tls.insecure_skip_verify);
         assert!(config.llm.system_prompt.git_context);
 
@@ -466,13 +460,13 @@ mod tests {
 
     #[test]
     fn test_merge_nested_partial_section() {
-        // User sets one auth field, the other should come from defaults
+        // User sets one tls field, the other should come from defaults
         let user_toml = r#"
             [meta]
             config_version = 3
 
-            [llm.auth]
-            openai_compat = "required"
+            [llm.tls]
+            insecure_skip_verify = true
         "#;
 
         let default_config = Config::load_defaults();
@@ -483,8 +477,7 @@ mod tests {
         let merged_value = merge_toml_values(default_value, user_value);
         let merged: Config = toml::from_str(&toml::to_string(&merged_value).unwrap()).unwrap();
 
-        assert_eq!(merged.llm.auth.openai_compat, "required");
-        assert_eq!(merged.llm.auth.anthropic_compat, "auto");
+        assert!(merged.llm.tls.insecure_skip_verify);
     }
 
     // ── CLI override tests ─────────────────────────────────────────────
@@ -603,7 +596,7 @@ mod tests {
     }
 
     #[test]
-    fn test_migrate_v1_to_v2_adds_auth_and_tls() {
+    fn test_migrate_v1_to_v2_adds_tls() {
         let raw = r#"
             [meta]
             config_version = 1
@@ -614,11 +607,7 @@ mod tests {
         let migrated = Config::migrate_v1_to_v2(value);
 
         let llm = migrated.get("llm").unwrap();
-        assert!(llm.get("auth").is_some());
         assert!(llm.get("tls").is_some());
-
-        let auth = llm.get("auth").unwrap();
-        assert_eq!(auth.get("openai_compat").unwrap().as_str(), Some("auto"));
     }
 
     #[test]
@@ -629,9 +618,6 @@ mod tests {
             [llm]
             default_provider = "openai-codex"
             default_model = "custom-model"
-            [llm.auth]
-            openai_compat = "required"
-            anthropic_compat = "auto"
             [llm.tls]
             insecure_skip_verify = false
         "#;

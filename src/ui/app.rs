@@ -343,19 +343,8 @@ impl App {
     /// a full Agent). Used by `/model` to update `self.provider` in-place.
     fn build_provider(&self) -> Box<dyn Provider> {
         let cfg = self.config.read();
-        let mut pc = ProviderConfig::new(
-            &cfg.llm.default_provider,
-            &cfg.llm.default_model,
-            &self.api_key,
-        );
-        if !cfg.llm.default_base_url.is_empty() {
-            pc.base_url = Some(cfg.llm.default_base_url.clone());
-        }
-        if cfg.llm.tls.insecure_skip_verify {
-            pc.insecure_skip_verify = true;
-        }
-        create_provider(&pc)
-            .unwrap_or_else(|_| create_provider(&ProviderConfig::new("mock", "mock", "")).unwrap())
+        let pc = cfg.llm.to_provider_config(&self.api_key);
+        create_provider(&pc).unwrap_or_else(|_| create_provider(&ProviderConfig::mock()).unwrap())
     }
 
     /// Build a new Agent from current state.
@@ -1052,7 +1041,7 @@ mod tests {
     /// Uses MockProvider and no real tools to keep tests fast.
     fn make_test_app() -> App {
         let config = Arc::new(RwLock::new(Config::load_defaults()));
-        let provider = create_provider(&ProviderConfig::new("mock", "mock", "")).unwrap();
+        let provider = create_provider(&ProviderConfig::mock()).unwrap();
         let tools: Vec<Box<dyn Tool>> = vec![];
         let session: Option<Session> = None;
         App::new(config, provider, tools, session, String::new())
@@ -1280,7 +1269,7 @@ mod tests {
             .unwrap();
 
         let config = Arc::new(RwLock::new(Config::load_defaults()));
-        let provider = create_provider(&ProviderConfig::new("mock", "mock", "")).unwrap();
+        let provider = create_provider(&ProviderConfig::mock()).unwrap();
         let tools: Vec<Box<dyn Tool>> = vec![];
         let mut app = App::new(config, provider, tools, Some(session), String::new());
 

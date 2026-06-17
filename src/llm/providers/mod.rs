@@ -40,6 +40,23 @@ impl ProviderConfig {
             insecure_skip_verify: false,
         }
     }
+
+    /// Create a config for the always-available mock provider.
+    pub fn mock() -> Self {
+        Self::new("mock", "mock", "")
+    }
+
+    /// Set the base URL override (fluent).
+    pub fn with_base_url(mut self, url: String) -> Self {
+        self.base_url = Some(url);
+        self
+    }
+
+    /// Enable or disable TLS certificate verification (fluent).
+    pub fn with_insecure_skip_verify(mut self, skip: bool) -> Self {
+        self.insecure_skip_verify = skip;
+        self
+    }
 }
 
 /// Create a provider instance from configuration.
@@ -76,7 +93,7 @@ mod tests {
 
     #[test]
     fn test_create_mock_provider() {
-        let config = ProviderConfig::new("mock", "mock", "");
+        let config = ProviderConfig::mock();
         let provider = create_provider(&config);
         assert!(provider.is_ok());
         let p = provider.unwrap();

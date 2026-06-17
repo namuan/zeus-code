@@ -99,19 +99,7 @@ async fn run_headless_inner(cli: Cli, prompt_arg: Option<String>) -> KonResult<i
     // Scope the read lock so it's dropped before awaits
     let (provider_config, system_prompt, extra_tools) = {
         let cfg = config.read();
-        let pc = ProviderConfig::new(
-            &cfg.llm.default_provider,
-            &cfg.llm.default_model,
-            &cli.api_key.unwrap_or_default(),
-        );
-        // Override base URL from config (or CLI, already merged)
-        let mut pc = pc; // rebind as mutable
-        if !cfg.llm.default_base_url.is_empty() {
-            pc.base_url = Some(cfg.llm.default_base_url.clone());
-        }
-        if cfg.llm.tls.insecure_skip_verify {
-            pc.insecure_skip_verify = true;
-        }
+        let pc = cfg.llm.to_provider_config(&cli.api_key.unwrap_or_default());
         let sp = cfg.llm.system_prompt.content.clone();
         let tools = cfg.tools.extra.clone();
         (pc, sp, tools)
@@ -124,7 +112,7 @@ async fn run_headless_inner(cli: Cli, prompt_arg: Option<String>) -> KonResult<i
         Ok(p) => p,
         Err(e) => {
             tracing::warn!("{e} — falling back to mock provider");
-            create_provider(&ProviderConfig::new("mock", "mock", ""))?
+            create_provider(&ProviderConfig::mock())?
         }
     };
 

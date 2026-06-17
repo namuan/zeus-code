@@ -54,20 +54,10 @@ async fn build_app(
 ) -> anyhow::Result<App> {
     let (provider, tools) = {
         let cfg = config.read();
-        let mut provider_config = ProviderConfig::new(
-            &cfg.llm.default_provider,
-            &cfg.llm.default_model,
-            &cli_api_key,
-        );
-        if !cfg.llm.default_base_url.is_empty() {
-            provider_config.base_url = Some(cfg.llm.default_base_url.clone());
-        }
-        if cfg.llm.tls.insecure_skip_verify {
-            provider_config.insecure_skip_verify = true;
-        }
+        let provider_config = cfg.llm.to_provider_config(&cli_api_key);
         let provider = create_provider(&provider_config).unwrap_or_else(|e| {
             tracing::warn!("{e} — using mock provider");
-            create_provider(&ProviderConfig::new("mock", "mock", "")).unwrap()
+            create_provider(&ProviderConfig::mock()).unwrap()
         });
         let tools = tools_mod::core_tools();
         (provider, tools)
